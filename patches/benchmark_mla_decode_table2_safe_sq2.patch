@@ -1,0 +1,283 @@
+diff --git a/hopper/benchmark_mla_decode.py b/hopper/benchmark_mla_decode.py
+index 07ba138..19adc55 100644
+--- a/hopper/benchmark_mla_decode.py
++++ b/hopper/benchmark_mla_decode.py
+@@ -41,7 +41,12 @@ DTYPE = torch.bfloat16
+ DEVICE = "cuda"
+ 
+ FA3_NUM_SPLITS = (1, 2, 4, 8, 16, 32, 0)
+-FA3_PACK_GQA = (True, False, None)
++# Do not benchmark explicit False.  The SM90 forward dispatcher forces PackGQA
++# for split-K and PagedKVNonTMA kernels, while scheduler metadata is built from
++# the user-provided value.  True and None keep metadata and kernel dispatch in
++# agreement; None uses the official heuristic after num_splits is resolved.
++FA3_PACK_GQA = (True, None)
++FA3_EXCLUDED_PACK_GQA = (False,)
+ FA3_PAGE_SIZES = (64, 128)
+ BATCH_SWEEP_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
+ 
+@@ -602,6 +607,103 @@ def compare_outputs(
+     }
+ 
+ 
++def require_output_close(
++    label: str,
++    actual: torch.Tensor,
++    reference: torch.Tensor,
++) -> dict[str, Any]:
++    comparison = compare_outputs(actual, reference)
++    if not comparison["allclose"]:
++        raise RuntimeError(
++            f"{label} failed: max_abs={comparison['max_abs']}, "
++            f"mean_abs={comparison['mean_abs']}"
++        )
++    return comparison
++
++
++def pytorch_mla_reference(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
++    """Independent FP32 reference for FA3's qv MLA path.
++
++    Each batch item is evaluated separately so this remains small enough for a
++    smoke test even at L=8192.  The causal mask is bottom-right aligned: for
++    s_q=2, row 0 sees L-1 keys and row 1 sees L keys.
++    """
++    outputs: list[torch.Tensor] = []
++    batch_size, s_q = inputs["q"].shape[:2]
++    for batch_idx in range(batch_size):
++        seqlen_k = int(inputs["cache_seqlens"][batch_idx].item())
++        page_ids = inputs["page_table"][batch_idx].long()
++        k = (
++            inputs["k_cache"]
++            .index_select(0, page_ids)
++            .reshape(-1, 1, MLA_ROPE_DIM)[:seqlen_k, 0]
++            .float()
++        )
++        v = (
++            inputs["v_cache"]
++            .index_select(0, page_ids)
++            .reshape(-1, 1, MLA_VALUE_DIM)[:seqlen_k, 0]
++            .float()
++        )
++        q = inputs["q"][batch_idx].float()
++        qv = inputs["qv"][batch_idx].float()
++        scores = torch.einsum("thd,sd->hts", q, k)
++        scores += torch.einsum("thd,sd->hts", qv, v)
++        scores *= MLA_SOFTMAX_SCALE
++        query_positions = seqlen_k - s_q + torch.arange(
++            s_q,
++            device=scores.device,
++        )
++        key_positions = torch.arange(seqlen_k, device=scores.device)
++        causal_mask = key_positions[None, :] > query_positions[:, None]
++        scores.masked_fill_(causal_mask[None, :, :], -torch.inf)
++        attention = torch.softmax(scores, dim=-1)
++        output = torch.einsum("hts,sd->thd", attention, v)
++        outputs.append(output.to(inputs["q"].dtype))
++    return torch.stack(outputs, dim=0)
++
++
++def split_flashmla_sq2_output(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
++    if inputs["q"].shape[1] != 2:
++        raise ValueError("split_flashmla_sq2_output requires s_q=2")
++    rows: list[torch.Tensor] = []
++    for query_idx, seqlen_k in enumerate((CONTEXT_LEN - 1, CONTEXT_LEN)):
++        row_inputs = dict(inputs)
++        row_inputs["q"] = inputs["q"][:, query_idx : query_idx + 1]
++        row_inputs["cache_seqlens"] = torch.full_like(
++            inputs["cache_seqlens"],
++            seqlen_k,
++        )
++        row_run, _ = make_mla_callable(row_inputs)
++        row_output, _ = row_run()
++        rows.append(row_output)
++    return torch.cat(rows, dim=1)
++
++
++def split_fa3_mla_sq2_output(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
++    if inputs["q"].shape[1] != 2:
++        raise ValueError("split_fa3_mla_sq2_output requires s_q=2")
++    rows: list[torch.Tensor] = []
++    batch_size = inputs["q"].shape[0]
++    for query_idx, seqlen_k in enumerate((CONTEXT_LEN - 1, CONTEXT_LEN)):
++        row_inputs = dict(inputs)
++        row_inputs["q"] = inputs["q"][:, query_idx : query_idx + 1]
++        row_inputs["qv"] = inputs["qv"][:, query_idx : query_idx + 1]
++        row_inputs["cache_seqlens"] = torch.full_like(
++            inputs["cache_seqlens"],
++            seqlen_k,
++        )
++        row_run, _ = make_fa3_mla_callable(
++            row_inputs,
++            batch_size=batch_size,
++            s_q=1,
++            num_splits=1,
++            pack_gqa=True,
++        )
++        rows.append(row_run())
++    return torch.cat(rows, dim=1)
++
++
+ def run_smoke(*, include_fa3_mla: bool = False) -> None:
+     failures: list[str] = []
+     for s_q in (1, 2):
+@@ -640,16 +742,41 @@ def run_smoke(*, include_fa3_mla: bool = False) -> None:
+                     fa3_output,
+                     (BATCH_SIZE, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
+                 )
+-                comparison = compare_outputs(fa3_output, flashmla_output)
+-                if not comparison["allclose"]:
+-                    raise RuntimeError(
+-                        "FA3 MLA output differs from FlashMLA: "
+-                        f"max_abs={comparison['max_abs']}, "
+-                        f"mean_abs={comparison['mean_abs']}"
++                pytorch_reference = pytorch_mla_reference(fa3_inputs)
++                fa3_vs_pytorch = require_output_close(
++                    "FA3 MLA vs independent PyTorch reference",
++                    fa3_output,
++                    pytorch_reference,
++                )
++                flashmla_vs_pytorch = require_output_close(
++                    "FlashMLA vs independent PyTorch reference",
++                    flashmla_output,
++                    pytorch_reference,
++                )
++                fa3_vs_flashmla = require_output_close(
++                    "FA3 MLA vs FlashMLA",
++                    fa3_output,
++                    flashmla_output,
++                )
++                if s_q == 2:
++                    flashmla_split = split_flashmla_sq2_output(flashmla_inputs)
++                    fa3_split = split_fa3_mla_sq2_output(fa3_inputs)
++                    require_output_close(
++                        "FlashMLA s_q=2 vs two bottom-right s_q=1 rows",
++                        flashmla_output,
++                        flashmla_split,
++                    )
++                    require_output_close(
++                        "FA3 MLA s_q=2 vs two bottom-right s_q=1 rows",
++                        fa3_output,
++                        fa3_split,
+                     )
+                 print(
+                     f"SMOKE_OK FA3-MLA s_q={s_q} "
+-                    f"vs_FlashMLA_max_abs={comparison['max_abs']:.6g}",
++                    f"vs_PyTorch_max_abs={fa3_vs_pytorch['max_abs']:.6g} "
++                    f"FlashMLA_vs_PyTorch_max_abs="
++                    f"{flashmla_vs_pytorch['max_abs']:.6g} "
++                    f"vs_FlashMLA_max_abs={fa3_vs_flashmla['max_abs']:.6g}",
+                     flush=True,
+                 )
+             except Exception as error:
+@@ -782,7 +909,7 @@ def run_gqa_case(
+             g=g,
+             page_size=page_size,
+             num_splits=1,
+-            pack_gqa=False,
++            pack_gqa=True,
+         )
+         reference_output = reference_run()
+         validate_tensor(
+@@ -1109,17 +1236,16 @@ def run_fa3_mla_batch_sweep(
+                 winner_output,
+                 (batch_size, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
+             )
+-            point["winner_vs_flashmla"] = compare_outputs(
++            point["winner_vs_flashmla"] = require_output_close(
++                "FA3 MLA batch winner vs FlashMLA",
+                 winner_output,
+                 flashmla_reference,
+             )
+-            if not point["winner_vs_flashmla"]["allclose"]:
+-                print(
+-                    "BATCH_CORRECTNESS_WARNING "
+-                    f"FA3-MLA s_q={s_q} B={batch_size} vs FlashMLA "
+-                    f"max_abs={point['winner_vs_flashmla']['max_abs']:.6g} "
+-                    f"mean_abs={point['winner_vs_flashmla']['mean_abs']:.6g}",
+-                    flush=True,
++            if s_q == 2:
++                point["winner_vs_two_sq1_rows"] = require_output_close(
++                    "FA3 MLA batch s_q=2 vs two bottom-right s_q=1 rows",
++                    winner_output,
++                    split_fa3_mla_sq2_output(inputs),
+                 )
+ 
+             time.sleep(args.batch_pre_final_sleep_s)
+@@ -1217,7 +1343,7 @@ def run_gqa_batch_sweep(
+                     g=g,
+                     page_size=page_size,
+                     num_splits=1,
+-                    pack_gqa=False,
++                    pack_gqa=True,
+                 )
+                 reference_output = reference_run()
+                 validate_tensor(
+@@ -1300,16 +1426,17 @@ def run_gqa_batch_sweep(
+                 winner_output,
+                 (batch_size, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
+             )
+-            difference = (
+-                winner_output.float()
+-                - references_by_page[winner["page_size"]].float()
+-            ).abs()
+-            point["winner_vs_layout_baseline_max_abs"] = float(
+-                difference.max().item()
+-            )
+-            point["winner_vs_layout_baseline_mean_abs"] = float(
+-                difference.mean().item()
++            point["winner_vs_layout_baseline"] = require_output_close(
++                "FA3 GQA batch winner vs pack_gqa=True baseline",
++                winner_output,
++                references_by_page[winner["page_size"]],
+             )
++            point["winner_vs_layout_baseline_max_abs"] = point[
++                "winner_vs_layout_baseline"
++            ]["max_abs"]
++            point["winner_vs_layout_baseline_mean_abs"] = point[
++                "winner_vs_layout_baseline"
++            ]["mean_abs"]
+             time.sleep(args.batch_pre_final_sleep_s)
+             point["cold_hbm_full_call_us"] = timing_quantiles_us(
+                 winner_run,
+@@ -1419,7 +1546,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+     )
+ 
+     result: dict[str, Any] = {
+-        "schema_version": 4,
++        "schema_version": 5,
+         "status": "running",
+         "started_at": utc_now(),
+         "protocol": {
+@@ -1444,6 +1571,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+                 "evaluate to 1/sqrt(576) for this fake-tensor MLA benchmark."
+             ),
+             "causal": True,
++            "s_q_2_semantics": (
++                "One call receives q/qv with shape [B, 2, H, D] and no incremental "
++                "k/v append. Bottom-right causal alignment makes query row 0 attend "
++                "to the first L-1 cached keys and row 1 attend to all L cached keys. "
++                "Table FLOPs count both rows; Table KV bytes count one shared cache scan."
++            ),
++            "s_q_2_correctness_gate": (
++                "The smoke test compares FA3 MLA and FlashMLA against an independent "
++                "FP32 PyTorch reference, then compares the fused s_q=2 result with two "
++                "separate s_q=1 calls using cache lengths L-1 and L. Batch FA3 MLA "
++                "winners must also match FlashMLA and the two-row decomposition."
++            ),
+             "primary_timing": (
+                 "CUDA-event full operator time from triton.testing.do_bench with "
+                 "L2 clear before each measured call; includes all launched attention "
+@@ -1452,6 +1591,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+             "hot_timing": "triton.testing.do_bench_cudagraph repeated same pointers",
+             "fa3_num_splits": list(FA3_NUM_SPLITS),
+             "fa3_pack_gqa": list(FA3_PACK_GQA),
++            "fa3_pack_gqa_excluded": list(FA3_EXCLUDED_PACK_GQA),
++            "fa3_pack_gqa_exclusion_reason": (
++                "Explicit False is excluded because the SM90 dispatcher forces PackGQA "
++                "for split-K and PagedKVNonTMA kernels while scheduler metadata retains "
++                "the explicit user value. True and None keep scheduler metadata and "
++                "kernel dispatch consistent."
++            ),
+             "fa3_page_sizes": list(FA3_PAGE_SIZES),
+             "fa3_layouts": list(gqa_layouts),
+             "fa3_dense_definition": (

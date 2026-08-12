@@ -1,0 +1,823 @@
+diff --git a/hopper/benchmark_mla_decode.py b/hopper/benchmark_mla_decode.py
+index 19adc55..9622623 100644
+--- a/hopper/benchmark_mla_decode.py
++++ b/hopper/benchmark_mla_decode.py
+@@ -49,6 +49,7 @@ FA3_PACK_GQA = (True, None)
+ FA3_EXCLUDED_PACK_GQA = (False,)
+ FA3_PAGE_SIZES = (64, 128)
+ BATCH_SWEEP_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
++TP_SWEEP_SIZES = (1, 2, 4, 8)
+ 
+ TABLE_WORK = {
+     ("flashmla_mqa_absorb", 1, 1): {
+@@ -84,6 +85,79 @@ TABLE_WORK = {
+ }
+ 
+ 
++def tp_local_heads_q(tp_size: int) -> int:
++    if tp_size not in TP_SWEEP_SIZES:
++        raise ValueError(
++            f"Unsupported TP size {tp_size}; expected one of {TP_SWEEP_SIZES}"
++        )
++    if NUM_HEADS_Q % tp_size != 0:
++        raise ValueError(
++            f"NUM_HEADS_Q={NUM_HEADS_Q} is not divisible by TP={tp_size}"
++        )
++    return NUM_HEADS_Q // tp_size
++
++
++def tp_local_heads_kv(g: int, tp_size: int) -> tuple[int, int]:
++    """Return local KV heads and replication factor for one simulated TP rank."""
++    tp_local_heads_q(tp_size)
++    if g >= tp_size:
++        if g % tp_size != 0:
++            raise ValueError(f"g={g} is not divisible by TP={tp_size}")
++        return g // tp_size, 1
++    if tp_size % g != 0:
++        raise ValueError(f"TP={tp_size} is not divisible by g={g}")
++    return 1, tp_size // g
++
++
++def tp_work_per_sequence(
++    *,
++    path: str,
++    g: int,
++    s_q: int,
++    tp_size: int,
++) -> dict[str, int]:
++    """Model work and rank-local KV bytes for one simulated TP rank."""
++    tp_local_heads_q(tp_size)
++    if path in ("mqa_absorb", "mla_qv"):
++        global_work = TABLE_WORK[("flashmla_mqa_absorb", 1, s_q)]
++        return {
++            "logical_bytes": global_work["logical_bytes"],
++            "physical_bytes": global_work["physical_bytes"],
++            "flops": global_work["flops"] // tp_size,
++        }
++    if path != "gqa":
++        raise ValueError(f"Unsupported TP path: {path}")
++    local_heads_kv, _ = tp_local_heads_kv(g, tp_size)
++    return {
++        "logical_bytes": (
++            CONTEXT_LEN
++            * (local_heads_kv * (128 + 128) + MLA_ROPE_DIM)
++            * torch.bfloat16.itemsize
++        ),
++        "physical_bytes": (
++            CONTEXT_LEN
++            * local_heads_kv
++            * (GQA_HEAD_DIM + GQA_VALUE_DIM)
++            * torch.bfloat16.itemsize
++        ),
++        "flops": TABLE_WORK[("fa3_gqa", g, s_q)]["flops"] // tp_size,
++    }
++
++
++def tp_point_metadata(*, g: int, tp_size: int) -> dict[str, int | bool]:
++    local_heads_kv, replication_factor = tp_local_heads_kv(g, tp_size)
++    return {
++        "tp_size": tp_size,
++        "simulated_rank": 0,
++        "global_num_heads_q": NUM_HEADS_Q,
++        "local_num_heads_q": tp_local_heads_q(tp_size),
++        "global_num_heads_kv": g,
++        "local_num_heads_kv": local_heads_kv,
++        "kv_replication_factor": replication_factor,
++        "collectives_included": False,
++    }
++
++
+ def utc_now() -> str:
+     return datetime.now(timezone.utc).isoformat()
+ 
+@@ -307,11 +381,13 @@ def make_mla_inputs(
+     s_q: int,
+     seed: int,
+     batch_size: int = BATCH_SIZE,
++    num_heads_q: int = NUM_HEADS_Q,
+ ) -> dict[str, torch.Tensor]:
+     components = make_mla_components(
+         s_q,
+         seed=seed,
+         batch_size=batch_size,
++        num_heads_q=num_heads_q,
+     )
+     return make_flashmla_inputs_from_components(components)
+ 
+@@ -320,13 +396,14 @@ def make_mla_components(
+     s_q: int,
+     seed: int,
+     batch_size: int = BATCH_SIZE,
++    num_heads_q: int = NUM_HEADS_Q,
+ ) -> dict[str, torch.Tensor]:
+     """Construct one mathematical MLA problem shared by FA3 and FlashMLA."""
+     torch.manual_seed(seed)
+     q_latent = torch.randn(
+         batch_size,
+         s_q,
+-        NUM_HEADS_Q,
++        num_heads_q,
+         MLA_VALUE_DIM,
+         device=DEVICE,
+         dtype=DTYPE,
+@@ -334,7 +411,7 @@ def make_mla_components(
+     q_rope = torch.randn(
+         batch_size,
+         s_q,
+-        NUM_HEADS_Q,
++        num_heads_q,
+         MLA_ROPE_DIM,
+         device=DEVICE,
+         dtype=DTYPE,
+@@ -399,11 +476,13 @@ def make_fa3_mla_inputs(
+     s_q: int,
+     seed: int,
+     batch_size: int = BATCH_SIZE,
++    num_heads_q: int = NUM_HEADS_Q,
+ ) -> dict[str, torch.Tensor]:
+     components = make_mla_components(
+         s_q,
+         seed=seed,
+         batch_size=batch_size,
++        num_heads_q=num_heads_q,
+     )
+     return {
+         "q": components["q_rope"],
+@@ -447,7 +526,7 @@ def make_fa3_mla_callable(
+         batch_size=batch_size,
+         max_seqlen_q=s_q,
+         max_seqlen_k=CONTEXT_LEN,
+-        num_heads_q=NUM_HEADS_Q,
++        num_heads_q=inputs["q"].shape[2],
+         num_heads_kv=1,
+         headdim=MLA_ROPE_DIM,
+         cache_seqlens=inputs["cache_seqlens"],
+@@ -482,12 +561,16 @@ def make_gqa_inputs(
+     page_size: int | None,
+     seed: int,
+     batch_size: int = BATCH_SIZE,
++    num_heads_q: int = NUM_HEADS_Q,
++    num_heads_kv: int | None = None,
+ ) -> dict[str, Any]:
+     torch.manual_seed(seed)
++    if num_heads_kv is None:
++        num_heads_kv = g
+     q = torch.randn(
+         batch_size,
+         s_q,
+-        NUM_HEADS_Q,
++        num_heads_q,
+         GQA_HEAD_DIM,
+         device=DEVICE,
+         dtype=DTYPE,
+@@ -496,7 +579,7 @@ def make_gqa_inputs(
+         k_cache = torch.randn(
+             batch_size,
+             CONTEXT_LEN,
+-            g,
++            num_heads_kv,
+             GQA_HEAD_DIM,
+             device=DEVICE,
+             dtype=DTYPE,
+@@ -504,7 +587,7 @@ def make_gqa_inputs(
+         v_cache = torch.randn(
+             batch_size,
+             CONTEXT_LEN,
+-            g,
++            num_heads_kv,
+             GQA_VALUE_DIM,
+             device=DEVICE,
+             dtype=DTYPE,
+@@ -515,7 +598,7 @@ def make_gqa_inputs(
+         k_cache = torch.randn(
+             batch_size * blocks_per_sequence,
+             page_size,
+-            g,
++            num_heads_kv,
+             GQA_HEAD_DIM,
+             device=DEVICE,
+             dtype=DTYPE,
+@@ -523,7 +606,7 @@ def make_gqa_inputs(
+         v_cache = torch.randn(
+             batch_size * blocks_per_sequence,
+             page_size,
+-            g,
++            num_heads_kv,
+             GQA_VALUE_DIM,
+             device=DEVICE,
+             dtype=DTYPE,
+@@ -562,8 +645,8 @@ def make_gqa_callable(
+         batch_size=batch_size,
+         max_seqlen_q=s_q,
+         max_seqlen_k=CONTEXT_LEN,
+-        num_heads_q=NUM_HEADS_Q,
+-        num_heads_kv=g,
++        num_heads_q=inputs["q"].shape[2],
++        num_heads_kv=inputs["k_cache"].shape[2],
+         headdim=GQA_HEAD_DIM,
+         cache_seqlens=inputs["cache_seqlens"],
+         qkv_dtype=DTYPE,
+@@ -704,7 +787,11 @@ def split_fa3_mla_sq2_output(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+     return torch.cat(rows, dim=1)
+ 
+ 
+-def run_smoke(*, include_fa3_mla: bool = False) -> None:
++def run_smoke(
++    *,
++    include_fa3_mla: bool = False,
++    tp_sizes: tuple[int, ...] = (),
++) -> None:
+     failures: list[str] = []
+     for s_q in (1, 2):
+         try:
+@@ -819,6 +906,133 @@ def run_smoke(*, include_fa3_mla: bool = False) -> None:
+                     )
+                     print(f"SMOKE_FAILED {failures[-1]}", flush=True)
+ 
++    for tp_size in tp_sizes:
++        if tp_size == 1:
++            continue
++        local_heads_q = tp_local_heads_q(tp_size)
++        for s_q in (1, 2):
++            try:
++                seed = 70_000 + tp_size * 100 + s_q
++                flashmla_inputs = make_mla_inputs(
++                    s_q,
++                    seed=seed,
++                    num_heads_q=local_heads_q,
++                )
++                flashmla_run, _ = make_mla_callable(flashmla_inputs)
++                flashmla_output, _ = flashmla_run()
++                validate_tensor(
++                    flashmla_output,
++                    (BATCH_SIZE, s_q, local_heads_q, MLA_VALUE_DIM),
++                )
++
++                fa3_inputs = make_fa3_mla_inputs(
++                    s_q,
++                    seed=seed,
++                    num_heads_q=local_heads_q,
++                )
++                fa3_run, _ = make_fa3_mla_callable(
++                    fa3_inputs,
++                    s_q=s_q,
++                    num_splits=1,
++                    pack_gqa=True,
++                )
++                fa3_output = fa3_run()
++                validate_tensor(
++                    fa3_output,
++                    (BATCH_SIZE, s_q, local_heads_q, MLA_VALUE_DIM),
++                )
++                pytorch_reference = pytorch_mla_reference(fa3_inputs)
++                require_output_close(
++                    f"TP={tp_size} FlashMLA vs PyTorch",
++                    flashmla_output,
++                    pytorch_reference,
++                )
++                require_output_close(
++                    f"TP={tp_size} FA3 MLA vs PyTorch",
++                    fa3_output,
++                    pytorch_reference,
++                )
++                require_output_close(
++                    f"TP={tp_size} FA3 MLA vs FlashMLA",
++                    fa3_output,
++                    flashmla_output,
++                )
++                if s_q == 2:
++                    require_output_close(
++                        f"TP={tp_size} FlashMLA fused vs two rows",
++                        flashmla_output,
++                        split_flashmla_sq2_output(flashmla_inputs),
++                    )
++                    require_output_close(
++                        f"TP={tp_size} FA3 MLA fused vs two rows",
++                        fa3_output,
++                        split_fa3_mla_sq2_output(fa3_inputs),
++                    )
++                print(
++                    f"SMOKE_OK TP={tp_size} MLA s_q={s_q} "
++                    f"local_hq={local_heads_q}",
++                    flush=True,
++                )
++            except Exception as error:
++                failures.append(
++                    f"TP={tp_size} MLA s_q={s_q}: "
++                    f"{type(error).__name__}: {error}"
++                )
++                print(f"SMOKE_FAILED {failures[-1]}", flush=True)
++
++        for layout, page_size in (("paged", 64), ("dense", None)):
++            for g in (8, 4):
++                local_heads_kv, replication_factor = tp_local_heads_kv(g, tp_size)
++                for s_q in (1, 2):
++                    try:
++                        inputs = make_gqa_inputs(
++                            s_q,
++                            g,
++                            page_size,
++                            seed=80_000 + tp_size * 1_000 + g * 10 + s_q,
++                            num_heads_q=local_heads_q,
++                            num_heads_kv=local_heads_kv,
++                        )
++                        reference_run, _ = make_gqa_callable(
++                            inputs,
++                            s_q=s_q,
++                            g=g,
++                            page_size=page_size,
++                            num_splits=1,
++                            pack_gqa=True,
++                        )
++                        reference_output = reference_run()
++                        candidate_run, _ = make_gqa_callable(
++                            inputs,
++                            s_q=s_q,
++                            g=g,
++                            page_size=page_size,
++                            num_splits=0,
++                            pack_gqa=True,
++                        )
++                        candidate_output = candidate_run()
++                        validate_tensor(
++                            candidate_output,
++                            (BATCH_SIZE, s_q, local_heads_q, GQA_VALUE_DIM),
++                        )
++                        require_output_close(
++                            f"TP={tp_size} GQA auto vs safe baseline",
++                            candidate_output,
++                            reference_output,
++                        )
++                        print(
++                            f"SMOKE_OK TP={tp_size} FA3 layout={layout} "
++                            f"g={g} local_g={local_heads_kv} "
++                            f"kv_replication={replication_factor} s_q={s_q}",
++                            flush=True,
++                        )
++                    except Exception as error:
++                        failures.append(
++                            f"TP={tp_size} FA3 layout={layout} g={g} "
++                            f"s_q={s_q}: {type(error).__name__}: {error}"
++                        )
++                        print(f"SMOKE_FAILED {failures[-1]}", flush=True)
++
+     if failures:
+         raise RuntimeError("; ".join(failures))
+     print("ALL_SMOKE_TESTS_OK", flush=True)
+@@ -1048,11 +1262,20 @@ def run_flashmla_batch_sweep(
+     args: argparse.Namespace,
+     entry: dict[str, Any],
+     save: Callable[[], None],
++    tp_size: int = 1,
+ ) -> None:
+-    work = entry["table_work_per_sequence"]
++    local_heads_q = tp_local_heads_q(tp_size)
++    work = tp_work_per_sequence(
++        path="mqa_absorb",
++        g=1,
++        s_q=s_q,
++        tp_size=tp_size,
++    )
+     for batch_size in args.batch_sizes:
+         point: dict[str, Any] = {
+             "batch_size": batch_size,
++            **tp_point_metadata(g=1, tp_size=tp_size),
++            "local_work_per_sequence": work,
+             "status": "running",
+         }
+         entry["points"].append(point)
+@@ -1062,16 +1285,17 @@ def run_flashmla_batch_sweep(
+                 s_q,
+                 seed=40_000 + s_q * 1_000 + batch_size,
+                 batch_size=batch_size,
++                num_heads_q=local_heads_q,
+             )
+             run, _ = make_mla_callable(inputs)
+             output, lse = run()
+             point["output_validation"] = validate_tensor(
+                 output,
+-                (batch_size, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
++                (batch_size, s_q, local_heads_q, MLA_VALUE_DIM),
+             )
+             point["lse_validation"] = validate_tensor(
+                 lse,
+-                (batch_size, NUM_HEADS_Q, s_q),
++                (batch_size, local_heads_q, s_q),
+             )
+             time.sleep(args.batch_pre_final_sleep_s)
+             point["cold_hbm_full_call_us"] = timing_quantiles_us(
+@@ -1099,7 +1323,7 @@ def run_flashmla_batch_sweep(
+             print(
+                 (
+                     "BATCH_RESULT "
+-                    f"FlashMLA s_q={s_q} B={batch_size} "
++                    f"FlashMLA s_q={s_q} B={batch_size} TP={tp_size} "
+                     f"full_us={full_call_us:.3f} "
+                     + (
+                         f"main_us={point['main_cold_us']:.3f} "
+@@ -1115,7 +1339,7 @@ def run_flashmla_batch_sweep(
+             point["error"] = as_error(error)
+             print(
+                 "BATCH_ERROR "
+-                f"FlashMLA s_q={s_q} B={batch_size}: "
++                f"FlashMLA s_q={s_q} B={batch_size} TP={tp_size}: "
+                 f"{type(error).__name__}: {error}",
+                 flush=True,
+             )
+@@ -1134,11 +1358,20 @@ def run_fa3_mla_batch_sweep(
+     args: argparse.Namespace,
+     entry: dict[str, Any],
+     save: Callable[[], None],
++    tp_size: int = 1,
+ ) -> None:
+-    work = entry["table_work_per_sequence"]
++    local_heads_q = tp_local_heads_q(tp_size)
++    work = tp_work_per_sequence(
++        path="mla_qv",
++        g=1,
++        s_q=s_q,
++        tp_size=tp_size,
++    )
+     for batch_size in args.batch_sizes:
+         point: dict[str, Any] = {
+             "batch_size": batch_size,
++            **tp_point_metadata(g=1, tp_size=tp_size),
++            "local_work_per_sequence": work,
+             "status": "running",
+             "sweep": [],
+         }
+@@ -1155,12 +1388,13 @@ def run_fa3_mla_batch_sweep(
+                 s_q,
+                 seed=seed,
+                 batch_size=batch_size,
++                num_heads_q=local_heads_q,
+             )
+             flashmla_run, _ = make_mla_callable(flashmla_inputs)
+             flashmla_reference, _ = flashmla_run()
+             validate_tensor(
+                 flashmla_reference,
+-                (batch_size, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
++                (batch_size, s_q, local_heads_q, MLA_VALUE_DIM),
+             )
+             del flashmla_run, flashmla_inputs
+             torch.cuda.empty_cache()
+@@ -1169,6 +1403,7 @@ def run_fa3_mla_batch_sweep(
+                 s_q,
+                 seed=seed,
+                 batch_size=batch_size,
++                num_heads_q=local_heads_q,
+             )
+             for num_splits in FA3_NUM_SPLITS:
+                 for pack_gqa in FA3_PACK_GQA:
+@@ -1202,7 +1437,7 @@ def run_fa3_mla_batch_sweep(
+                         candidate["error"] = as_error(error)
+                         print(
+                             "BATCH_SWEEP_ERROR "
+-                            f"FA3-MLA s_q={s_q} B={batch_size} "
++                            f"FA3-MLA s_q={s_q} B={batch_size} TP={tp_size} "
+                             f"page={MLA_PAGE_SIZE} splits={num_splits} "
+                             f"pack={pack_gqa}: {type(error).__name__}: {error}",
+                             flush=True,
+@@ -1234,7 +1469,7 @@ def run_fa3_mla_batch_sweep(
+             winner_output = winner_run()
+             point["output_validation"] = validate_tensor(
+                 winner_output,
+-                (batch_size, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
++                (batch_size, s_q, local_heads_q, MLA_VALUE_DIM),
+             )
+             point["winner_vs_flashmla"] = require_output_close(
+                 "FA3 MLA batch winner vs FlashMLA",
+@@ -1274,6 +1509,7 @@ def run_fa3_mla_batch_sweep(
+             print(
+                 (
+                     f"BATCH_RESULT FA3-MLA s_q={s_q} B={batch_size} "
++                    f"TP={tp_size} "
+                     f"page={MLA_PAGE_SIZE} splits={winner['num_splits']} "
+                     f"pack={winner['pack_gqa']} full_us={full_call_us:.3f} "
+                     + (
+@@ -1289,7 +1525,8 @@ def run_fa3_mla_batch_sweep(
+             point["status"] = "error"
+             point["error"] = as_error(error)
+             print(
+-                f"BATCH_ERROR FA3-MLA s_q={s_q} B={batch_size}: "
++                f"BATCH_ERROR FA3-MLA s_q={s_q} B={batch_size} "
++                f"TP={tp_size}: "
+                 f"{type(error).__name__}: {error}",
+                 flush=True,
+             )
+@@ -1310,14 +1547,24 @@ def run_gqa_batch_sweep(
+     args: argparse.Namespace,
+     entry: dict[str, Any],
+     save: Callable[[], None],
++    tp_size: int = 1,
+ ) -> None:
+-    work = entry["table_work_per_sequence"]
++    local_heads_q = tp_local_heads_q(tp_size)
++    local_heads_kv, _ = tp_local_heads_kv(g, tp_size)
++    work = tp_work_per_sequence(
++        path="gqa",
++        g=g,
++        s_q=s_q,
++        tp_size=tp_size,
++    )
+     page_sizes: tuple[int | None, ...]
+     page_sizes = (None,) if layout == "dense" else FA3_PAGE_SIZES
+ 
+     for batch_size in args.batch_sizes:
+         point: dict[str, Any] = {
+             "batch_size": batch_size,
++            **tp_point_metadata(g=g, tp_size=tp_size),
++            "local_work_per_sequence": work,
+             "status": "running",
+             "sweep": [],
+         }
+@@ -1334,6 +1581,8 @@ def run_gqa_batch_sweep(
+                     page_size,
+                     seed=50_000 + g * 10_000 + s_q * 1_000 + batch_size,
+                     batch_size=batch_size,
++                    num_heads_q=local_heads_q,
++                    num_heads_kv=local_heads_kv,
+                 )
+                 inputs_by_page[page_size] = inputs
+                 reference_run, _ = make_gqa_callable(
+@@ -1348,7 +1597,7 @@ def run_gqa_batch_sweep(
+                 reference_output = reference_run()
+                 validate_tensor(
+                     reference_output,
+-                    (batch_size, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
++                    (batch_size, s_q, local_heads_q, GQA_VALUE_DIM),
+                 )
+                 references_by_page[page_size] = reference_output
+ 
+@@ -1389,7 +1638,8 @@ def run_gqa_batch_sweep(
+                             print(
+                                 "BATCH_SWEEP_ERROR "
+                                 f"layout={layout} g={g} s_q={s_q} "
+-                                f"B={batch_size} page={page_size} "
++                                f"B={batch_size} TP={tp_size} "
++                                f"local_g={local_heads_kv} page={page_size} "
+                                 f"splits={num_splits} pack={pack_gqa}: "
+                                 f"{type(error).__name__}: {error}",
+                                 flush=True,
+@@ -1424,7 +1674,7 @@ def run_gqa_batch_sweep(
+             winner_output = winner_run()
+             point["output_validation"] = validate_tensor(
+                 winner_output,
+-                (batch_size, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
++                (batch_size, s_q, local_heads_q, GQA_VALUE_DIM),
+             )
+             point["winner_vs_layout_baseline"] = require_output_close(
+                 "FA3 GQA batch winner vs pack_gqa=True baseline",
+@@ -1464,6 +1714,7 @@ def run_gqa_batch_sweep(
+                 (
+                     "BATCH_RESULT "
+                     f"FA3 layout={layout} g={g} s_q={s_q} B={batch_size} "
++                    f"TP={tp_size} local_g={local_heads_kv} "
+                     f"page={winner['page_size']} splits={winner['num_splits']} "
+                     f"pack={winner['pack_gqa']} full_us={full_call_us:.3f} "
+                     + (
+@@ -1480,7 +1731,8 @@ def run_gqa_batch_sweep(
+             point["error"] = as_error(error)
+             print(
+                 "BATCH_ERROR "
+-                f"FA3 layout={layout} g={g} s_q={s_q} B={batch_size}: "
++                f"FA3 layout={layout} g={g} s_q={s_q} B={batch_size} "
++                f"TP={tp_size} local_g={local_heads_kv}: "
+                 f"{type(error).__name__}: {error}",
+                 flush=True,
+             )
+@@ -1546,7 +1798,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+     )
+ 
+     result: dict[str, Any] = {
+-        "schema_version": 5,
++        "schema_version": 6 if args.tp_sweep else 5,
+         "status": "running",
+         "started_at": utc_now(),
+         "protocol": {
+@@ -1610,7 +1862,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+             "final_rep_ms": args.final_rep_ms,
+             "hot_rep_ms": args.hot_rep_ms if args.hot else None,
+             "profile_num_tests": args.profile_num_tests if args.profile else None,
+-            "batch_sweep_enabled": args.batch_sweep,
++            "batch_sweep_enabled": args.batch_sweep and not args.tp_sweep,
+             "fa3_mla_batch_sweep_enabled": args.include_fa3_mla,
+             "batch_sizes": list(args.batch_sizes) if args.batch_sweep else None,
+             "batch_sweep_semantics": (
+@@ -1619,6 +1871,17 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+                 if args.batch_sweep
+                 else None
+             ),
++            "tp_sweep_enabled": args.tp_sweep,
++            "tp_sizes": list(args.tp_sizes) if args.tp_sweep else None,
++            "tp_simulation_semantics": (
++                "One GPU executes the rank-local attention tensors for a balanced "
++                "representative TP rank. Q heads are 128/TP. MLA/MQA KV is replicated. "
++                "GQA local KV heads are max(g/TP, 1), with KV replication when TP>g. "
++                "No NCCL or other collectives are included. Global query-token "
++                "throughput equals B*s_q/full_call_us and is not multiplied by TP."
++                if args.tp_sweep
++                else None
++            ),
+             "batch_sweep_warmup_ms": (
+                 args.batch_sweep_warmup_ms if args.batch_sweep else None
+             ),
+@@ -1666,6 +1929,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+         "environment": environment_metadata(args.device_role),
+         "cases": [],
+         "batch_sweeps": [],
++        "tp_sweeps": [],
+     }
+ 
+     def save() -> None:
+@@ -1752,7 +2016,104 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+                         )
+                     torch.cuda.empty_cache()
+ 
+-    if args.batch_sweep:
++    if args.tp_sweep:
++        if not args.gqa_only:
++            for s_q in (1, 2):
++                entry: dict[str, Any] = {
++                    "implementation": "FlashMLA",
++                    "path": "mqa_absorb",
++                    "layout": "identity_paged",
++                    "g": 1,
++                    "s_q": s_q,
++                    "qk_dim": MLA_HEAD_DIM,
++                    "value_dim": MLA_VALUE_DIM,
++                    "softmax_scale": MLA_SOFTMAX_SCALE,
++                    "tp_sizes": list(args.tp_sizes),
++                    "table_work_per_sequence_tp1": dict(
++                        TABLE_WORK[("flashmla_mqa_absorb", 1, s_q)]
++                    ),
++                    "points": [],
++                    "status": "running",
++                }
++                result["tp_sweeps"].append(entry)
++                save()
++                for tp_size in args.tp_sizes:
++                    entry["status"] = "running"
++                    run_flashmla_batch_sweep(
++                        s_q=s_q,
++                        args=args,
++                        entry=entry,
++                        save=save,
++                        tp_size=tp_size,
++                    )
++
++        if args.include_fa3_mla:
++            for s_q in (1, 2):
++                entry = {
++                    "implementation": "FA3",
++                    "path": "mla_qv",
++                    "layout": "paged",
++                    "g": 1,
++                    "s_q": s_q,
++                    "page_size": MLA_PAGE_SIZE,
++                    "qk_dim": MLA_HEAD_DIM,
++                    "fa3_q_dim": MLA_ROPE_DIM,
++                    "fa3_qv_dim": MLA_VALUE_DIM,
++                    "value_dim": MLA_VALUE_DIM,
++                    "softmax_scale": MLA_SOFTMAX_SCALE,
++                    "tp_sizes": list(args.tp_sizes),
++                    "table_work_per_sequence_tp1": dict(
++                        TABLE_WORK[("flashmla_mqa_absorb", 1, s_q)]
++                    ),
++                    "points": [],
++                    "status": "running",
++                }
++                result["tp_sweeps"].append(entry)
++                save()
++                for tp_size in args.tp_sizes:
++                    entry["status"] = "running"
++                    run_fa3_mla_batch_sweep(
++                        s_q=s_q,
++                        args=args,
++                        entry=entry,
++                        save=save,
++                        tp_size=tp_size,
++                    )
++
++        for layout in gqa_layouts:
++            for g in (8, 4):
++                for s_q in (1, 2):
++                    entry = {
++                        "implementation": "FA3",
++                        "path": "gqa",
++                        "layout": layout,
++                        "g": g,
++                        "s_q": s_q,
++                        "qk_dim": GQA_HEAD_DIM,
++                        "value_dim": GQA_VALUE_DIM,
++                        "softmax_scale": GQA_SOFTMAX_SCALE,
++                        "tp_sizes": list(args.tp_sizes),
++                        "table_work_per_sequence_tp1": dict(
++                            TABLE_WORK[("fa3_gqa", g, s_q)]
++                        ),
++                        "points": [],
++                        "status": "running",
++                    }
++                    result["tp_sweeps"].append(entry)
++                    save()
++                    for tp_size in args.tp_sizes:
++                        entry["status"] = "running"
++                        run_gqa_batch_sweep(
++                            g=g,
++                            s_q=s_q,
++                            layout=layout,
++                            args=args,
++                            entry=entry,
++                            save=save,
++                            tp_size=tp_size,
++                        )
++
++    elif args.batch_sweep:
+         if not args.gqa_only:
+             for s_q in (1, 2):
+                 entry: dict[str, Any] = {
+@@ -1843,12 +2204,20 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+         for entry in result["batch_sweeps"]
+         if entry["status"] != "complete"
+     ]
++    tp_errors = [
++        entry
++        for entry in result["tp_sweeps"]
++        if entry["status"] != "complete"
++    ]
+     result["status"] = (
+-        "complete" if not errors and not batch_errors else "complete_with_errors"
++        "complete"
++        if not errors and not batch_errors and not tp_errors
++        else "complete_with_errors"
+     )
+     result["completed_at"] = utc_now()
+     result["error_case_count"] = len(errors)
+     result["error_batch_sweep_count"] = len(batch_errors)
++    result["error_tp_sweep_count"] = len(tp_errors)
+     save()
+     return result
+ 
+@@ -1867,6 +2236,7 @@ def parse_args() -> argparse.Namespace:
+     )
+     parser.add_argument("--smoke-only", action="store_true")
+     parser.add_argument("--smoke-fa3-mla", action="store_true")
++    parser.add_argument("--smoke-tp", action="store_true")
+     parser.add_argument("--gqa-only", action="store_true")
+     parser.add_argument("--include-fa3-mla", action="store_true")
+     parser.add_argument(
+@@ -1876,6 +2246,13 @@ def parse_args() -> argparse.Namespace:
+     )
+     parser.add_argument("--batch-sweep", action="store_true")
+     parser.add_argument("--batch-only", action="store_true")
++    parser.add_argument("--tp-sweep", action="store_true")
++    parser.add_argument(
++        "--tp-sizes",
++        type=int,
++        nargs="+",
++        default=list(TP_SWEEP_SIZES),
++    )
+     parser.add_argument(
+         "--batch-sizes",
+         type=int,
+@@ -1917,6 +2294,10 @@ def main() -> None:
+         raise ValueError("Every --batch-profile-sizes value must be positive")
+     if len(set(args.batch_profile_sizes)) != len(args.batch_profile_sizes):
+         raise ValueError("--batch-profile-sizes values must be unique")
++    if any(tp_size not in TP_SWEEP_SIZES for tp_size in args.tp_sizes):
++        raise ValueError(f"Every --tp-sizes value must be one of {TP_SWEEP_SIZES}")
++    if len(set(args.tp_sizes)) != len(args.tp_sizes):
++        raise ValueError("--tp-sizes values must be unique")
+     if args.batch_only and not args.batch_sweep:
+         raise ValueError("--batch-only requires --batch-sweep")
+     if args.profile_batch and not args.batch_sweep:
+@@ -1931,9 +2312,18 @@ def main() -> None:
+         raise ValueError("--batch-profile-num-tests must be positive")
+     if args.include_fa3_mla and not args.batch_sweep:
+         raise ValueError("--include-fa3-mla requires --batch-sweep")
++    if args.tp_sweep and not args.batch_sweep:
++        raise ValueError("--tp-sweep requires --batch-sweep")
++    if args.tp_sweep and not args.batch_only:
++        raise ValueError("--tp-sweep requires --batch-only")
++    if args.tp_sweep and len(args.batch_sizes) != 1:
++        raise ValueError("--tp-sweep requires exactly one --batch-sizes value")
+     torch.set_grad_enabled(False)
+     if args.smoke_only:
+-        run_smoke(include_fa3_mla=args.smoke_fa3_mla)
++        run_smoke(
++            include_fa3_mla=args.smoke_fa3_mla,
++            tp_sizes=tuple(args.tp_sizes) if args.smoke_tp else (),
++        )
+         return
+     result = run_benchmark(args)
+     print(f"RESULT_JSON={args.output}", flush=True)
+@@ -1956,7 +2346,8 @@ def main() -> None:
+         raise RuntimeError(
+             "Benchmark completed with "
+             f"{result['error_case_count']} errored cases and "
+-            f"{result['error_batch_sweep_count']} errored batch sweeps"
++            f"{result['error_batch_sweep_count']} errored batch sweeps and "
++            f"{result['error_tp_sweep_count']} errored TP sweeps"
+         )
+ 
+ 

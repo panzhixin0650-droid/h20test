@@ -1,0 +1,935 @@
+diff --git a/hopper/benchmark_mla_decode.py b/hopper/benchmark_mla_decode.py
+index 99b1b7a..9bdc732 100644
+--- a/hopper/benchmark_mla_decode.py
++++ b/hopper/benchmark_mla_decode.py
+@@ -1,129 +1,822 @@
+ # Copyright (c) 2025, Ted Zadouri, Tri Dao.
+ 
+-# We recommend locking GPU clocks before running the benchmark to ensure consistent results.
+-# This can be done using the following commands (1830 MHz is the clock for H100):
+-# sudo nvidia-smi -i 0 -pm 1
+-# sudo nvidia-smi -i 0 --lock-gpu-clocks 1830,1830
+-# See more here: https://github.com/triton-lang/triton/blob/d9f10ebdc5da53f73eb852fde73d8d7d80b679d1/python/triton/testing.py#L487
++# GQLA Table 2 adaptation of the official FA3 MLA decode benchmark.
++# This file intentionally keeps the official standalone FlashAttention-3,
++# FlashMLA, and Triton timing paths. It constructs fake BF16 tensors only.
+ 
++from __future__ import annotations
++
++import argparse
++import importlib.metadata
++import json
++import math
++import os
++import platform
++import subprocess
++import sys
+ import time
+-import torch
+-import torch.nn.functional as F
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Callable
+ 
++import torch
+ from triton.testing import do_bench, do_bench_cudagraph
+ 
+-from einops import rearrange
+-
+ from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
++from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+ 
+-try:
+-    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+-except ImportError:
+-    flash_mla_with_kvcache, get_mla_metadata = None, None
+ 
+-try:
+-    from flash_attn.utils.benchmark import pytorch_profiler
+-except ImportError:
+-    pytorch_profiler = None
++BATCH_SIZE = 1
++CONTEXT_LEN = 8192
++NUM_HEADS_Q = 128
++MLA_HEAD_DIM = 576
++MLA_VALUE_DIM = 512
++GQA_HEAD_DIM = 192
++GQA_VALUE_DIM = 128
++SOFTMAX_SCALE = 1.0 / math.sqrt(192)
++DTYPE = torch.bfloat16
++DEVICE = "cuda"
+ 
++FA3_NUM_SPLITS = (1, 2, 4, 8, 16, 32, 0)
++FA3_PACK_GQA = (True, False, None)
++FA3_PAGE_SIZES = (64, 128)
+ 
+-device = "cuda"
+-dtype = torch.bfloat16
+-seqlen = 8192
+-seqlen_q = 1
+-# nheads_q = 16
+-nheads_q = 128
++TABLE_WORK = {
++    ("flashmla_mqa_absorb", 1, 1): {
++        "logical_bytes": 9_437_184,
++        "physical_bytes": 9_437_184,
++        "flops": 2_281_701_376,
++    },
++    ("flashmla_mqa_absorb", 1, 2): {
++        "logical_bytes": 9_437_184,
++        "physical_bytes": 9_437_184,
++        "flops": 4_563_402_752,
++    },
++    ("fa3_gqa", 8, 1): {
++        "logical_bytes": 34_603_008,
++        "physical_bytes": 41_943_040,
++        "flops": 671_088_640,
++    },
++    ("fa3_gqa", 8, 2): {
++        "logical_bytes": 34_603_008,
++        "physical_bytes": 41_943_040,
++        "flops": 1_342_177_280,
++    },
++    ("fa3_gqa", 4, 1): {
++        "logical_bytes": 17_825_792,
++        "physical_bytes": 20_971_520,
++        "flops": 671_088_640,
++    },
++    ("fa3_gqa", 4, 2): {
++        "logical_bytes": 17_825_792,
++        "physical_bytes": 20_971_520,
++        "flops": 1_342_177_280,
++    },
++}
+ 
+-use_bench_cudagraph = False
+ 
+-attn_variants = ["mha", "gqa", "mqa", "mla", "gla"]
+-# for attn_variant in attn_variants:
+-for attn_variant in attn_variants[3:5]:
+-    nheads_kv = nheads_q if attn_variant == "mha" else (max(nheads_q // 8, 1) if attn_variant == "gqa" else (1 if attn_variant == "mla" else 2))
+-    headdim = 64 if attn_variant in ["mla", "gla"] else 128
+-    headdim_v = 512 if attn_variant == "mla" else (256 if attn_variant == "gla" else headdim)
+-    has_qv = headdim == 64 and headdim_v > 64
+-    # page_size = None
+-    page_size = 64 if attn_variant in ["mla", "gla"] else 128
++def utc_now() -> str:
++    return datetime.now(timezone.utc).isoformat()
+ 
+-    should_run_flashmla = attn_variant == "mla" and page_size == 64 and flash_mla_with_kvcache is not None
+ 
+-    torch.manual_seed(0)
++def git_revision(path: Path) -> str | None:
++    try:
++        return subprocess.check_output(
++            ["git", "-C", str(path), "rev-parse", "HEAD"],
++            text=True,
++            stderr=subprocess.DEVNULL,
++        ).strip()
++    except Exception:
++        return None
++
++
++def command_output(command: list[str]) -> str | None:
++    try:
++        return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
++    except Exception as error:
++        return f"ERROR: {type(error).__name__}: {error}"
++
++
++def write_json(payload: dict[str, Any], output_path: Path) -> None:
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
++    temporary_path.write_text(
++        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
++        encoding="utf-8",
++    )
++    os.replace(temporary_path, output_path)
++
++
++def as_error(error: BaseException) -> dict[str, str]:
++    return {
++        "type": type(error).__name__,
++        "message": str(error),
++    }
++
++
++def validate_tensor(output: torch.Tensor, expected_shape: tuple[int, ...]) -> dict[str, Any]:
++    torch.cuda.synchronize()
++    actual_shape = tuple(output.shape)
++    if actual_shape != expected_shape:
++        raise RuntimeError(f"Expected output shape {expected_shape}, got {actual_shape}")
++    finite = bool(torch.isfinite(output).all().item())
++    if not finite:
++        raise RuntimeError("Output contains NaN or Inf")
++    return {
++        "shape": list(actual_shape),
++        "dtype": str(output.dtype),
++        "finite": finite,
++    }
++
++
++def timing_quantiles_us(
++    fn: Callable[[], Any],
++    *,
++    warmup_ms: float,
++    rep_ms: float,
++) -> dict[str, float]:
++    values_ms = do_bench(
++        fn,
++        warmup=warmup_ms,
++        rep=rep_ms,
++        quantiles=[0.2, 0.5, 0.8],
++    )
++    return {
++        "p20": float(values_ms[0]) * 1_000.0,
++        "median": float(values_ms[1]) * 1_000.0,
++        "p80": float(values_ms[2]) * 1_000.0,
++    }
++
++
++def timing_median_us(
++    fn: Callable[[], Any],
++    *,
++    warmup_ms: float,
++    rep_ms: float,
++) -> float:
++    value_ms = do_bench(
++        fn,
++        warmup=warmup_ms,
++        rep=rep_ms,
++        return_mode="median",
++    )
++    return float(value_ms) * 1_000.0
++
++
++def hot_timing_quantiles_us(fn: Callable[[], Any], *, rep_ms: float) -> dict[str, float]:
++    values_ms = do_bench_cudagraph(fn, rep=rep_ms, quantiles=[0.2, 0.5, 0.8])
++    return {
++        "p20": float(values_ms[0]) * 1_000.0,
++        "median": float(values_ms[1]) * 1_000.0,
++        "p80": float(values_ms[2]) * 1_000.0,
++    }
++
++
++def derived_metrics(work: dict[str, int], step_us: float, s_q: int) -> dict[str, float]:
++    return {
++        "tok_per_s": s_q * 1_000_000.0 / step_us,
++        "model_TFLOPS": work["flops"] / step_us / 1_000_000.0,
++        "table_logical_TB_per_s": work["logical_bytes"] / step_us / 1_000_000.0,
++        "physical_KV_TB_per_s": work["physical_bytes"] / step_us / 1_000_000.0,
++    }
++
++
++def import_official_profiler() -> Any | None:
++    benchmark_root = Path(__file__).resolve().parents[2]
++    flashmla_tests = benchmark_root / "FlashMLA" / "tests"
++    if not flashmla_tests.is_dir():
++        return None
++    sys.path.insert(0, str(flashmla_tests))
++    try:
++        import kernelkit
++
++        return kernelkit
++    except Exception:
++        return None
++
++
++def profile_kernels(
++    fn: Callable[[], Any],
++    *,
++    num_tests: int,
++    flush_l2: bool,
++) -> dict[str, Any]:
++    kernelkit = import_official_profiler()
++    if kernelkit is None:
++        raise RuntimeError("Official FlashMLA kernelkit profiler is unavailable")
++    profile = kernelkit.bench_kineto(fn, num_tests=num_tests, flush_l2=flush_l2)
++    kernels = []
++    for name, ranges in profile.time_ranges.items():
++        total_seconds = sum(end - start for start, end in ranges)
++        kernels.append(
++            {
++                "name": name,
++                "invocations_total": len(ranges),
++                "invocations_per_call": len(ranges) / profile.num_tests,
++                "sum_us_per_call": total_seconds * 1_000_000.0 / profile.num_tests,
++                "mean_us_per_invocation": total_seconds * 1_000_000.0 / len(ranges),
++                "likely_target_kernel": (
++                    "flash" in name.lower()
++                    or "fmha" in name.lower()
++                    or "cutlass" in name.lower()
++                ),
++            }
++        )
++    kernels.sort(key=lambda item: item["sum_us_per_call"], reverse=True)
++    return {
++        "num_tests": profile.num_tests,
++        "flush_l2": flush_l2,
++        "kernels": kernels,
++    }
++
++
++def make_mla_inputs(s_q: int, seed: int) -> dict[str, torch.Tensor]:
++    torch.manual_seed(seed)
++    q = torch.randn(
++        BATCH_SIZE,
++        s_q,
++        NUM_HEADS_Q,
++        MLA_HEAD_DIM,
++        device=DEVICE,
++        dtype=DTYPE,
++    ) / 10
++    kv_cache = torch.randn(
++        CONTEXT_LEN // 64,
++        64,
++        1,
++        MLA_HEAD_DIM,
++        device=DEVICE,
++        dtype=DTYPE,
++    ) / 10
++    block_table = torch.arange(
++        CONTEXT_LEN // 64,
++        device=DEVICE,
++        dtype=torch.int32,
++    ).view(BATCH_SIZE, -1)
++    cache_seqlens = torch.full(
++        (BATCH_SIZE,),
++        CONTEXT_LEN,
++        device=DEVICE,
++        dtype=torch.int32,
++    )
++    return {
++        "q": q,
++        "kv_cache": kv_cache,
++        "block_table": block_table,
++        "cache_seqlens": cache_seqlens,
++    }
++
++
++def make_mla_callable(
++    inputs: dict[str, torch.Tensor],
++) -> tuple[Callable[[], tuple[torch.Tensor, torch.Tensor]], Any]:
++    scheduler_metadata, num_splits = get_mla_metadata()
++
++    def run() -> tuple[torch.Tensor, torch.Tensor]:
++        return flash_mla_with_kvcache(
++            inputs["q"],
++            inputs["kv_cache"],
++            inputs["block_table"],
++            inputs["cache_seqlens"],
++            MLA_VALUE_DIM,
++            scheduler_metadata,
++            num_splits,
++            softmax_scale=SOFTMAX_SCALE,
++            causal=True,
++        )
++
++    return run, scheduler_metadata
++
++
++def make_gqa_inputs(s_q: int, g: int, page_size: int, seed: int) -> dict[str, torch.Tensor]:
++    torch.manual_seed(seed)
++    q = torch.randn(
++        BATCH_SIZE,
++        s_q,
++        NUM_HEADS_Q,
++        GQA_HEAD_DIM,
++        device=DEVICE,
++        dtype=DTYPE,
++    ) / 10
++    k_cache = torch.randn(
++        CONTEXT_LEN // page_size,
++        page_size,
++        g,
++        GQA_HEAD_DIM,
++        device=DEVICE,
++        dtype=DTYPE,
++    ) / 10
++    v_cache = torch.randn(
++        CONTEXT_LEN // page_size,
++        page_size,
++        g,
++        GQA_VALUE_DIM,
++        device=DEVICE,
++        dtype=DTYPE,
++    ) / 10
++    page_table = torch.arange(
++        CONTEXT_LEN // page_size,
++        device=DEVICE,
++        dtype=torch.int32,
++    ).view(BATCH_SIZE, -1)
++    cache_seqlens = torch.full(
++        (BATCH_SIZE,),
++        CONTEXT_LEN,
++        device=DEVICE,
++        dtype=torch.int32,
++    )
++    return {
++        "q": q,
++        "k_cache": k_cache,
++        "v_cache": v_cache,
++        "page_table": page_table,
++        "cache_seqlens": cache_seqlens,
++    }
++
++
++def make_gqa_callable(
++    inputs: dict[str, torch.Tensor],
++    *,
++    s_q: int,
++    g: int,
++    page_size: int,
++    num_splits: int,
++    pack_gqa: bool | None,
++) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
++    scheduler_metadata = get_scheduler_metadata(
++        batch_size=BATCH_SIZE,
++        max_seqlen_q=s_q,
++        max_seqlen_k=CONTEXT_LEN,
++        num_heads_q=NUM_HEADS_Q,
++        num_heads_kv=g,
++        headdim=GQA_HEAD_DIM,
++        cache_seqlens=inputs["cache_seqlens"],
++        qkv_dtype=DTYPE,
++        headdim_v=GQA_VALUE_DIM,
++        page_size=page_size,
++        causal=True,
++        num_splits=num_splits,
++        pack_gqa=pack_gqa,
++    )
++
++    def run() -> torch.Tensor:
++        return flash_attn_with_kvcache(
++            inputs["q"],
++            inputs["k_cache"],
++            inputs["v_cache"],
++            cache_seqlens=inputs["cache_seqlens"],
++            page_table=inputs["page_table"],
++            softmax_scale=SOFTMAX_SCALE,
++            causal=True,
++            scheduler_metadata=scheduler_metadata,
++            num_splits=num_splits,
++            pack_gqa=pack_gqa,
++        )
++
++    return run, scheduler_metadata
++
+ 
+-    batch_size = 128
+-    cache_seqlens = None
+-    # cache_seqlens = torch.tensor([seqlen] * batch_size, device=device, dtype=torch.int)
+-    # cache_seqlens = torch.tensor([seqlen - 1, 1024, 1024, 1024], device=device, dtype=torch.int32)
+-    # cache_seqlens = torch.tensor([1024] * batch_size, device=device, dtype=torch.int)
+-    # cache_seqlens = torch.tensor([4500, 45000, 1800, 1800], dtype=torch.int32, device=device)
++def run_smoke() -> None:
++    failures: list[str] = []
++    for s_q in (1, 2):
++        try:
++            inputs = make_mla_inputs(s_q, seed=100 + s_q)
++            run, _ = make_mla_callable(inputs)
++            output, lse = run()
++            validate_tensor(output, (BATCH_SIZE, s_q, NUM_HEADS_Q, MLA_VALUE_DIM))
++            validate_tensor(lse, (BATCH_SIZE, NUM_HEADS_Q, s_q))
++            print(f"SMOKE_OK FlashMLA s_q={s_q}", flush=True)
++        except Exception as error:
++            failures.append(f"FlashMLA s_q={s_q}: {type(error).__name__}: {error}")
++            print(f"SMOKE_FAILED {failures[-1]}", flush=True)
++
++    for g in (8, 4):
++        for s_q in (1, 2):
++            try:
++                inputs = make_gqa_inputs(s_q, g, 64, seed=1_000 + g * 10 + s_q)
++                run, _ = make_gqa_callable(
++                    inputs,
++                    s_q=s_q,
++                    g=g,
++                    page_size=64,
++                    num_splits=0,
++                    pack_gqa=True,
++                )
++                output = run()
++                validate_tensor(output, (BATCH_SIZE, s_q, NUM_HEADS_Q, GQA_VALUE_DIM))
++                print(f"SMOKE_OK FA3 g={g} s_q={s_q}", flush=True)
++            except Exception as error:
++                failures.append(f"FA3 g={g} s_q={s_q}: {type(error).__name__}: {error}")
++                print(f"SMOKE_FAILED {failures[-1]}", flush=True)
++
++    if failures:
++        raise RuntimeError("; ".join(failures))
++    print("ALL_SMOKE_TESTS_OK", flush=True)
++
++
++def run_flashmla_case(
++    *,
++    s_q: int,
++    args: argparse.Namespace,
++    case: dict[str, Any],
++    save: Callable[[], None],
++) -> None:
++    inputs = make_mla_inputs(s_q, seed=10_000 + s_q)
++    run, _ = make_mla_callable(inputs)
++
++    output, lse = run()
++    case["output_validation"] = validate_tensor(
++        output,
++        (BATCH_SIZE, s_q, NUM_HEADS_Q, MLA_VALUE_DIM),
++    )
++    case["lse_validation"] = validate_tensor(
++        lse,
++        (BATCH_SIZE, NUM_HEADS_Q, s_q),
++    )
++    save()
+ 
+-    print(f"\n{attn_variant.upper()}, nheads_q = {nheads_q}, nheads_kv = {nheads_kv}, headdim = {headdim}, headdim_v = {headdim_v}, page_size = {page_size}")
++    time.sleep(args.pre_final_sleep_s)
++    case["cold_hbm_full_call_us"] = timing_quantiles_us(
++        run,
++        warmup_ms=args.final_warmup_ms,
++        rep_ms=args.final_rep_ms,
++    )
++    step_us = case["cold_hbm_full_call_us"]["median"]
++    case["derived_from_cold_median"] = derived_metrics(case["table_work"], step_us, s_q)
++    save()
+ 
+-    for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
+-    # for seqlen in [s * 1024 for s in [8]]:
+-        cache_seqlens = torch.tensor([seqlen] * batch_size, device=device, dtype=torch.int)
+-        num_splits = 0
+-        q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, dtype=dtype, device=device)
++    if args.hot:
+         try:
+-            v_cache = torch.randn(batch_size, seqlen, nheads_kv, headdim_v, dtype=dtype, device=device)
+-            k_cache = torch.randn(batch_size, seqlen, nheads_kv, headdim, dtype=dtype, device=device)
+-            if page_size is not None:
+-                assert seqlen % page_size == 0
+-                k_cache, v_cache = [rearrange(x, "b (n p) h d -> (b n) p h d", p=page_size) for x in [k_cache, v_cache]]
+-                page_table = rearrange(torch.arange(batch_size * seqlen // page_size, device=device, dtype=torch.int32),
+-                                    "(b s) -> b s", s=seqlen // page_size)
+-            else:
+-                page_table = None
+-        except torch.OutOfMemoryError:
+-            continue
+-        qv = torch.randn(batch_size, seqlen_q, nheads_q, headdim_v, dtype=dtype, device=device) if has_qv else None
+-
+-        # Precomputing this saves ~2us
+-        scheduler_metadata = get_scheduler_metadata(
+-            batch_size, seqlen_q, seqlen, nheads_q, nheads_kv, headdim,
+-            cache_seqlens, q.dtype, headdim_v=headdim_v, page_size=page_size, causal=True
++            case["hot_l2_cuda_graph_us"] = hot_timing_quantiles_us(
++                run,
++                rep_ms=args.hot_rep_ms,
++            )
++        except Exception as error:
++            case["hot_l2_error"] = as_error(error)
++        save()
++
++    if args.profile:
++        try:
++            case["cold_kineto_profile"] = profile_kernels(
++                run,
++                num_tests=args.profile_num_tests,
++                flush_l2=True,
++            )
++        except Exception as error:
++            case["profile_error"] = as_error(error)
++        save()
++
++    case["status"] = "complete"
++    save()
++
++
++def run_gqa_case(
++    *,
++    g: int,
++    s_q: int,
++    args: argparse.Namespace,
++    case: dict[str, Any],
++    save: Callable[[], None],
++) -> None:
++    successful_candidates: list[dict[str, Any]] = []
++    inputs_by_page: dict[int, dict[str, torch.Tensor]] = {}
++    references_by_page: dict[int, torch.Tensor] = {}
++
++    for page_size in FA3_PAGE_SIZES:
++        inputs = make_gqa_inputs(
++            s_q,
++            g,
++            page_size,
++            seed=20_000 + g * 100 + s_q,
++        )
++        inputs_by_page[page_size] = inputs
++        reference_run, _ = make_gqa_callable(
++            inputs,
++            s_q=s_q,
++            g=g,
++            page_size=page_size,
++            num_splits=1,
++            pack_gqa=False,
++        )
++        reference_output = reference_run()
++        validate_tensor(
++            reference_output,
++            (BATCH_SIZE, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
+         )
+-        # scheduler_metadata = None
+-        # breakpoint()
+-        fn0 = lambda: flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens, num_splits=num_splits, qv=qv, page_table=page_table, causal=True, scheduler_metadata=scheduler_metadata)
+-        time.sleep(1)  # to avoid power throttling
+-        # Time in ms
+-        if not use_bench_cudagraph:
+-            t0 = do_bench(fn0, warmup=1, rep=10)
++        references_by_page[page_size] = reference_output
++
++        for num_splits in FA3_NUM_SPLITS:
++            for pack_gqa in FA3_PACK_GQA:
++                candidate: dict[str, Any] = {
++                    "page_size": page_size,
++                    "num_splits": num_splits,
++                    "pack_gqa": pack_gqa,
++                    "status": "running",
++                }
++                case["sweep"].append(candidate)
++                save()
++                try:
++                    run, _ = make_gqa_callable(
++                        inputs,
++                        s_q=s_q,
++                        g=g,
++                        page_size=page_size,
++                        num_splits=num_splits,
++                        pack_gqa=pack_gqa,
++                    )
++                    output = run()
++                    candidate["output_validation"] = validate_tensor(
++                        output,
++                        (BATCH_SIZE, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
++                    )
++                    difference = (output.float() - reference_output.float()).abs()
++                    candidate["vs_page_baseline_max_abs"] = float(difference.max().item())
++                    candidate["vs_page_baseline_mean_abs"] = float(difference.mean().item())
++                    candidate["cold_hbm_full_call_median_us"] = timing_median_us(
++                        run,
++                        warmup_ms=args.sweep_warmup_ms,
++                        rep_ms=args.sweep_rep_ms,
++                    )
++                    candidate["status"] = "complete"
++                    successful_candidates.append(candidate)
++                    print(
++                        "SWEEP "
++                        f"g={g} s_q={s_q} page={page_size} "
++                        f"splits={num_splits} pack={pack_gqa} "
++                        f"us={candidate['cold_hbm_full_call_median_us']:.3f}",
++                        flush=True,
++                    )
++                except Exception as error:
++                    candidate["status"] = "error"
++                    candidate["error"] = as_error(error)
++                    print(
++                        "SWEEP_ERROR "
++                        f"g={g} s_q={s_q} page={page_size} "
++                        f"splits={num_splits} pack={pack_gqa}: "
++                        f"{type(error).__name__}: {error}",
++                        flush=True,
++                    )
++                save()
++
++    if not successful_candidates:
++        raise RuntimeError(f"No successful FA3 candidate for g={g}, s_q={s_q}")
++
++    winner = min(
++        successful_candidates,
++        key=lambda item: item["cold_hbm_full_call_median_us"],
++    )
++    case["winner_from_sweep"] = {
++        "page_size": winner["page_size"],
++        "num_splits": winner["num_splits"],
++        "pack_gqa": winner["pack_gqa"],
++        "sweep_median_us": winner["cold_hbm_full_call_median_us"],
++    }
++    save()
++
++    winner_run, _ = make_gqa_callable(
++        inputs_by_page[winner["page_size"]],
++        s_q=s_q,
++        g=g,
++        page_size=winner["page_size"],
++        num_splits=winner["num_splits"],
++        pack_gqa=winner["pack_gqa"],
++    )
++    winner_output = winner_run()
++    case["output_validation"] = validate_tensor(
++        winner_output,
++        (BATCH_SIZE, s_q, NUM_HEADS_Q, GQA_VALUE_DIM),
++    )
++
++    time.sleep(args.pre_final_sleep_s)
++    case["cold_hbm_full_call_us"] = timing_quantiles_us(
++        winner_run,
++        warmup_ms=args.final_warmup_ms,
++        rep_ms=args.final_rep_ms,
++    )
++    step_us = case["cold_hbm_full_call_us"]["median"]
++    case["derived_from_cold_median"] = derived_metrics(case["table_work"], step_us, s_q)
++    save()
++
++    if args.hot:
++        try:
++            case["hot_l2_cuda_graph_us"] = hot_timing_quantiles_us(
++                winner_run,
++                rep_ms=args.hot_rep_ms,
++            )
++        except Exception as error:
++            case["hot_l2_error"] = as_error(error)
++        save()
++
++    if args.profile:
++        try:
++            case["cold_kineto_profile"] = profile_kernels(
++                winner_run,
++                num_tests=args.profile_num_tests,
++                flush_l2=True,
++            )
++        except Exception as error:
++            case["profile_error"] = as_error(error)
++        save()
++
++    case["status"] = "complete"
++    save()
++
++
++def environment_metadata(device_role: str) -> dict[str, Any]:
++    properties = torch.cuda.get_device_properties(0)
++    script_path = Path(__file__).resolve()
++    flash_attention_repo = script_path.parents[1]
++    benchmark_root = script_path.parents[2]
++    flashmla_repo = benchmark_root / "FlashMLA"
++    l2_size = getattr(properties, "L2_cache_size", None)
++    if l2_size is None:
++        l2_size = getattr(properties, "l2_cache_size", None)
++    return {
++        "paper_device_role": device_role,
++        "actual_device_name": properties.name,
++        "compute_capability": list(torch.cuda.get_device_capability(0)),
++        "multi_processor_count": properties.multi_processor_count,
++        "total_memory_bytes": properties.total_memory,
++        "l2_cache_size_bytes": l2_size,
++        "device_uuid": str(getattr(properties, "uuid", "unknown")),
++        "torch_version": torch.__version__,
++        "torch_cuda_version": torch.version.cuda,
++        "python_version": platform.python_version(),
++        "flash_mla_version": importlib.metadata.version("flash-mla"),
++        "flash_mla_module": str(sys.modules["flash_mla"].__file__),
++        "flash_attn_3_version": importlib.metadata.version("flash-attn-3"),
++        "flash_attn_interface_module": str(sys.modules["flash_attn_interface"].__file__),
++        "flashmla_commit": git_revision(flashmla_repo),
++        "flashattention_commit": git_revision(flash_attention_repo),
++        "nvidia_smi": command_output(
++            [
++                "nvidia-smi",
++                "-i",
++                "0",
++                "--query-gpu=name,uuid,driver_version,memory.total,pstate,power.limit,clocks.current.sm,clocks.max.sm",
++                "--format=csv,noheader,nounits",
++            ]
++        ),
++        "clocks_locked_by_benchmark": False,
++    }
++
++
++def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
++    torch.cuda.set_device(0)
++    torch.manual_seed(0)
++    if torch.cuda.get_device_capability(0) != (9, 0):
++        raise RuntimeError("The official kernels in this run require Hopper SM90")
++
++    result: dict[str, Any] = {
++        "schema_version": 1,
++        "status": "running",
++        "started_at": utc_now(),
++        "protocol": {
++            "source": "patched official flash-attention/hopper/benchmark_mla_decode.py",
++            "fake_tensors_only": True,
++            "batch_size": BATCH_SIZE,
++            "context_length": CONTEXT_LEN,
++            "num_heads_q": NUM_HEADS_Q,
++            "dtype": str(DTYPE),
++            "softmax_scale": SOFTMAX_SCALE,
++            "causal": True,
++            "primary_timing": "triton.testing.do_bench with L2 clear before each measured call",
++            "hot_timing": "triton.testing.do_bench_cudagraph repeated same pointers",
++            "fa3_num_splits": list(FA3_NUM_SPLITS),
++            "fa3_pack_gqa": list(FA3_PACK_GQA),
++            "fa3_page_sizes": list(FA3_PAGE_SIZES),
++            "sweep_warmup_ms": args.sweep_warmup_ms,
++            "sweep_rep_ms": args.sweep_rep_ms,
++            "final_warmup_ms": args.final_warmup_ms,
++            "final_rep_ms": args.final_rep_ms,
++            "hot_rep_ms": args.hot_rep_ms if args.hot else None,
++            "profile_num_tests": args.profile_num_tests if args.profile else None,
++            "stock_fa3_shared_rope_limitation": (
++                "Stock FA3 physically repeats the 64-D RoPE key for every KV group. "
++                "Table logical bandwidth is an equivalent paper metric, not measured DRAM traffic."
++            ),
++        },
++        "environment": environment_metadata(args.device_role),
++        "cases": [],
++    }
++
++    def save() -> None:
++        write_json(result, args.output)
++
++    save()
++
++    if not args.gqa_only:
++        for s_q in (1, 2):
++            work = dict(TABLE_WORK[("flashmla_mqa_absorb", 1, s_q)])
++            case: dict[str, Any] = {
++                "implementation": "FlashMLA",
++                "path": "mqa_absorb",
++                "g": 1,
++                "s_q": s_q,
++                "page_size": 64,
++                "qk_dim": MLA_HEAD_DIM,
++                "value_dim": MLA_VALUE_DIM,
++                "table_work": work,
++                "status": "running",
++            }
++            result["cases"].append(case)
++            save()
++            try:
++                run_flashmla_case(s_q=s_q, args=args, case=case, save=save)
++            except Exception as error:
++                case["status"] = "error"
++                case["error"] = as_error(error)
++                save()
++                print(f"CASE_ERROR FlashMLA s_q={s_q}: {type(error).__name__}: {error}", flush=True)
++
++    for g in (8, 4):
++        for s_q in (1, 2):
++            work = dict(TABLE_WORK[("fa3_gqa", g, s_q)])
++            case = {
++                "implementation": "FA3",
++                "path": "gqa",
++                "g": g,
++                "s_q": s_q,
++                "qk_dim": GQA_HEAD_DIM,
++                "value_dim": GQA_VALUE_DIM,
++                "table_work": work,
++                "sweep": [],
++                "status": "running",
++            }
++            result["cases"].append(case)
++            save()
++            try:
++                run_gqa_case(g=g, s_q=s_q, args=args, case=case, save=save)
++            except Exception as error:
++                case["status"] = "error"
++                case["error"] = as_error(error)
++                save()
++                print(
++                    f"CASE_ERROR FA3 g={g} s_q={s_q}: {type(error).__name__}: {error}",
++                    flush=True,
++                )
++            torch.cuda.empty_cache()
++
++    errors = [case for case in result["cases"] if case["status"] != "complete"]
++    result["status"] = "complete" if not errors else "complete_with_errors"
++    result["completed_at"] = utc_now()
++    result["error_case_count"] = len(errors)
++    save()
++    return result
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--output",
++        type=Path,
++        default=Path("table2_official.json"),
++    )
++    parser.add_argument(
++        "--device-role",
++        choices=("l20z-h100", "h20"),
++        default="l20z-h100",
++    )
++    parser.add_argument("--smoke-only", action="store_true")
++    parser.add_argument("--gqa-only", action="store_true")
++    parser.add_argument("--hot", action="store_true")
++    parser.add_argument("--profile", action="store_true")
++    parser.add_argument("--sweep-warmup-ms", type=float, default=2.0)
++    parser.add_argument("--sweep-rep-ms", type=float, default=8.0)
++    parser.add_argument("--final-warmup-ms", type=float, default=20.0)
++    parser.add_argument("--final-rep-ms", type=float, default=100.0)
++    parser.add_argument("--hot-rep-ms", type=float, default=5.0)
++    parser.add_argument("--profile-num-tests", type=int, default=5)
++    parser.add_argument("--pre-final-sleep-s", type=float, default=1.0)
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    torch.set_grad_enabled(False)
++    if args.smoke_only:
++        run_smoke()
++        return
++    result = run_benchmark(args)
++    print(f"RESULT_JSON={args.output}", flush=True)
++    for case in result["cases"]:
++        if "cold_hbm_full_call_us" in case:
++            print(
++                f"RESULT {case['implementation']} g={case['g']} s_q={case['s_q']} "
++                f"cold_median_us={case['cold_hbm_full_call_us']['median']:.3f}",
++                flush=True,
++            )
+         else:
+-            torch.cuda.synchronize()  # Gotta wait, otherwise e.g. k_cache might not be ready
+-            with torch.cuda.stream(torch.cuda.Stream()):
+-                t0 = do_bench_cudagraph(fn0, rep=10)
+-        # exit(0)
+-        if should_run_flashmla:
+-            # Separate out the preprocessing since this can be done once and reused for all layers
+-            mla_metadata = get_mla_metadata(cache_seqlens, seqlen_q * nheads_q // nheads_kv, nheads_kv)
+-            q_concat = torch.concat([q, qv], dim=-1) if has_qv else q
+-            kv_cache_concat = torch.concat([v_cache, k_cache], dim=-1)
+-            fn1 = lambda: flash_mla_with_kvcache(q_concat, kv_cache_concat, page_table, cache_seqlens, headdim_v, *mla_metadata, causal=True)
+-            time.sleep(1)  # to avoid power throttling
+-            if not use_bench_cudagraph:
+-                t1 = do_bench(fn1, warmup=1, rep=10)
+-            else:
+-                torch.cuda.synchronize()  # Gotta wait, otherwise e.g. k_cache might not be ready
+-                with torch.cuda.stream(torch.cuda.Stream()):
+-                    t1 = do_bench_cudagraph(fn1, rep=10)
+-
+-        total_seqlen = seqlen * batch_size if cache_seqlens is None else cache_seqlens.sum().item()
+-        mem_io = total_seqlen * nheads_kv * (headdim + headdim_v) * 2 + q.numel() * 2 + (qv.numel() * 2 if has_qv else 0) + q.numel() * headdim_v // headdim * 2  # last term is for the output
+-        flops = seqlen_q * total_seqlen * nheads_q * (headdim + headdim_v * (2 if has_qv else 1)) * 2
+-        ideal_h100_time_mem = mem_io / 3.35e12 * 1e6
+-        ideal_h100_time_flop = flops / 989e12 * 1e6
+-        ideal_h100_time = max(ideal_h100_time_mem, ideal_h100_time_flop)
+-        print(f"Seqlen = {seqlen}, FA3 time{'' if not use_bench_cudagraph else ' w CUDA Graph'}: {t0 * 1e3:.1f} us, {mem_io * 1e-9 / (t0 * 1e-3):.0f} GB/s, {flops * 1e-12 / (t0 * 1e-3):.0f} TFLOPS/s")
+-        if should_run_flashmla:
+-            print(f"Seqlen = {seqlen}, FlashMLA time{'' if not use_bench_cudagraph else ' w CUDA Graph'}: {t1 * 1e3:.1f} us, {mem_io * 1e-9 / (t1 * 1e-3):.0f} GB/s, {flops * 1e-12 / (t1 * 1e-3):.0f} TFLOPS/s")
+-        print(f"Arithmetic intensity: {flops / mem_io:.1f}")
+-        print(f"Ideal time: {ideal_h100_time:.0f} us")
+-
+-        # if pytorch_profiler is not None:
+-        #     time.sleep(1)  # to avoid power throttling
+-        #     pytorch_profiler(fn0)
+-        #     if should_run_flashmla:
+-        #         time.sleep(1)  # to avoid power throttling
+-        #         pytorch_profiler(fn1)
++            print(
++                f"RESULT {case['implementation']} g={case['g']} s_q={case['s_q']} "
++                f"status={case['status']}",
++                flush=True,
++            )
++    if result["status"] != "complete":
++        raise RuntimeError(
++            f"Benchmark completed with {result['error_case_count']} errored cases"
++        )
++
++
++if __name__ == "__main__":
++    main()
+
