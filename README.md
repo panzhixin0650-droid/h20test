@@ -15,17 +15,24 @@
 
 - FlashMLA：`15f13e5030374295491c5ce31b02d7e63a7772c6`
 - FlashAttention：`a369df707e1980fb328abcc1733e3457ec10155f`
-- 推荐复现环境：Python 3.12、PyTorch `2.11.0+cu130`、CUDA 13.0、Triton 3.6.0
+- H20 当前复现环境：Python 3.12、PyTorch `2.11.0+cu128`、CUDA 12.8、Triton 3.6.0
 
 构建脚本会从官方仓库检出上述提交，并将独立的 `flash-mla` 和 `flash-attn-3` 扩展安装到指定虚拟环境。补丁的 SHA256 固定在 `patches/SHA256SUMS`。
 
 ## 最短运行方法
 
-```bash
-git clone https://github.com/panzhixin0650-droid/h20test.git
-cd h20test
+如果 H20 节点尚无环境，安装脚本会创建或复用 conda 环境 `h20table2`。普通包和 NVIDIA 依赖固定从清华镜像安装，Torch 本体从官方 cu128 索引安装：
 
-export GQLA_TABLE2_PYTHON=/absolute/path/to/venv/bin/python
+```bash
+bash scripts/install_cu128_env.sh
+conda activate h20table2
+```
+
+然后执行：
+
+```bash
+export GQLA_TABLE2_PYTHON="$(command -v python)"
+export GQLA_TABLE2_UV="$(command -v uv)"
 export CUDA_HOME=/usr/local/cuda
 export GQLA_TABLE2_GPU=0
 export GQLA_KERNEL_BUILD_CPU_BUDGET=1024

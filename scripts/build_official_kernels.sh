@@ -52,7 +52,7 @@ if [[ -z "$bench_uv" || ! -x "$bench_uv" ]]; then
     exit 2
 fi
 test -x "$bench_cuda_home/bin/nvcc"
-test -d "$bench_cuda_home/include/cccl"
+test -d "$bench_cuda_home/include"
 test -f "$bench_preflight"
 command -v git
 command -v nvidia-smi
@@ -157,18 +157,27 @@ git -C "$bench_tmp/flash-attention" submodule update --init csrc/cutlass
 
 if [[ "$bench_fa3_only" == 0 ]]; then
     printf 'Starting FlashMLA compilation\n'
-    env \
-        CUDA_HOME="$bench_cuda_home" \
-        FLASH_MLA_DISABLE_SM100=1 \
-        FLASH_MLA_DISABLE_FP16=1 \
-        MAX_JOBS=24 \
-        NVCC_THREADS=2 \
-        NVCC_APPEND_FLAGS="--split-compile=$bench_mla_split" \
-        CPLUS_INCLUDE_PATH="$bench_cuda_home/include/cccl" \
-        C_INCLUDE_PATH="$bench_cuda_home/include/cccl" \
-        UV_CACHE_DIR="$bench_tmp/uv-cache" \
-        UV_LINK_MODE=copy \
-        NINJA_STATUS='[%f/%t, %o/sec] ' \
+    bench_mla_env=(
+        "CUDA_HOME=$bench_cuda_home"
+        FLASH_MLA_DISABLE_SM100=1
+        FLASH_MLA_DISABLE_FP16=1
+        MAX_JOBS=24
+        NVCC_THREADS=2
+        "NVCC_APPEND_FLAGS=--split-compile=$bench_mla_split"
+        "UV_CACHE_DIR=$bench_tmp/uv-cache"
+        UV_LINK_MODE=copy
+        'NINJA_STATUS=[%f/%t, %o/sec] '
+    )
+    # CUDA 13 moved CCCL below include/cccl. CUDA 12.8, which the
+    # official FlashMLA/FA3 repositories recommend for Hopper, uses the
+    # standard CUDA include search path and must not require that directory.
+    if [[ -d "$bench_cuda_home/include/cccl" ]]; then
+        bench_mla_env+=(
+            "CPLUS_INCLUDE_PATH=$bench_cuda_home/include/cccl${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+            "C_INCLUDE_PATH=$bench_cuda_home/include/cccl${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+        )
+    fi
+    env "${bench_mla_env[@]}" \
         "$bench_uv" pip install \
             --python "$bench_python" \
             --no-build-isolation \

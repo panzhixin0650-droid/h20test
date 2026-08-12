@@ -42,8 +42,8 @@ $$
 
 - NVIDIA H20，SM90；
 - Python 3.12；
-- PyTorch `2.11.0+cu130`；
-- CUDA toolkit 13.0；
+- PyTorch `2.11.0+cu128`；
+- CUDA toolkit 12.8；
 - Triton 3.6.0；
 - `uv`、Git、Ninja、NVCC 和 `nvidia-smi` 可用；
 - 虚拟环境中已有编译 FlashMLA/FA3 所需的 PyTorch C++ extension 依赖。
@@ -55,6 +55,17 @@ export GQLA_TABLE2_PYTHON=/absolute/path/to/venv/bin/python
 export CUDA_HOME=/usr/local/cuda
 export GQLA_TABLE2_GPU=0
 ```
+
+如果尚未准备虚拟环境，可直接创建并安装固定的 cu128 依赖：
+
+```bash
+bash scripts/install_cu128_env.sh
+conda activate h20table2
+export GQLA_TABLE2_PYTHON="$(command -v python)"
+export GQLA_TABLE2_UV="$(command -v uv)"
+```
+
+该脚本忽略集群级 pip 配置，普通包和 NVIDIA CUDA 依赖只走清华 PyPI 镜像，随后以 `--no-deps` 从 PyTorch 官方 cu128 索引安装 Torch，避免依赖解析再次访问不可达的 NVIDIA 镜像。
 
 如果 `uv` 不在 `PATH`：
 
