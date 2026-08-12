@@ -16,13 +16,39 @@ if [[ "${1:-}" != --inside-conda && "${CONDA_DEFAULT_ENV:-}" != "$conda_env_name
         printf 'conda is unavailable; activate a Python 3.12 environment first.\n' >&2
         exit 2
     fi
-    if ! conda run -n "$conda_env_name" python -c 'import sys' >/dev/null 2>&1; then
+    conda_env_prefix=$(conda env list | \
+        awk -v target="$conda_env_name" '$1 == target {print $NF; exit}')
+    if [[ -z "$conda_env_prefix" ]]; then
+        conda_base=$(conda info --base)
+        conda_default_prefix="$conda_base/envs/$conda_env_name"
+        if [[ -d "$conda_default_prefix" ]]; then
+            conda_env_prefix=$conda_default_prefix
+        fi
+    fi
+    if [[ -z "$conda_env_prefix" ]]; then
         printf 'Creating conda environment: %s\n' "$conda_env_name"
         conda create -n "$conda_env_name" python=3.12 -y
+        conda_env_prefix=$(conda env list | \
+            awk -v target="$conda_env_name" '$1 == target {print $NF; exit}')
     else
-        printf 'Reusing conda environment: %s\n' "$conda_env_name"
+        printf 'Reusing conda environment: %s (%s)\n' \
+            "$conda_env_name" "$conda_env_prefix"
     fi
-    conda run --no-capture-output -n "$conda_env_name" \
+    if [[ -z "$conda_env_prefix" ]]; then
+        printf 'Unable to resolve conda environment prefix: %s\n' \
+            "$conda_env_name" >&2
+        exit 2
+    fi
+    if [[ ! -x "$conda_env_prefix/bin/python" ]]; then
+        printf 'Repairing Python in existing conda prefix: %s\n' \
+            "$conda_env_prefix"
+        conda install -p "$conda_env_prefix" python=3.12 -y
+    fi
+    test -x "$conda_env_prefix/bin/python"
+    env \
+        PATH="$conda_env_prefix/bin:$PATH" \
+        CONDA_PREFIX="$conda_env_prefix" \
+        CONDA_DEFAULT_ENV="$conda_env_name" \
         bash "$script_path" --inside-conda
     exit 0
 fi
