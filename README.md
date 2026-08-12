@@ -121,3 +121,22 @@ bash scripts/run_h20_roofline.sh
 - `outputs/official/roofline/h20_hardware_roofline.log`
 
 如果显存不足，可以调小 `GQLA_ROOFLINE_READ_GIB`、`GQLA_ROOFLINE_COPY_GIB` 和 `GQLA_ROOFLINE_STREAM_GIB`；正式判断建议保持默认值，使每次扫描远大于 H20 的 L2。
+
+## FA3 GQA：varlen 与固定长度 scheduler A/B
+
+Table 2 基线向 FA3 传入全为 8192 的 `cache_seqlens`，因此会分发到 `VarlenDynamicPersistentTileScheduler`。下面的诊断在同一份张量上交替比较：
+
+- 原调用：`cache_seqlens` 加预生成 scheduler metadata，`num_splits=1, pack_gqa=True`；
+- 严格固定长度：同时省略 `cache_seqlens` 与 scheduler metadata，其余设置不变；
+- 固定长度 auto：再让 FA3 自行选择 `num_splits` 与 `pack_gqa`。
+
+运行：
+
+```bash
+bash scripts/run_h20_gqa_scheduler_ab.sh
+```
+
+默认测试 B=128 下 paged/dense、`g in {8,4}`、`s_q in {1,2}` 共八组，复用同一份输入做正确性检查。结果写到：
+
+- `outputs/official/gqa_scheduler_ab/h20_fa3_gqa_scheduler_ab.json`
+- `outputs/official/gqa_scheduler_ab/h20_fa3_gqa_scheduler_ab.log`
