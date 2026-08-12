@@ -21,6 +21,14 @@
 
 ## 最短运行方法
 
+如需先只读扫描 QS 挂载盘中的现成环境：
+
+```bash
+bash scripts/find_qs_envs.sh
+```
+
+默认优先扫描 `/mnt/nj-1/dataset/data`，否则扫描 `/mnt`；也可以把挂载目录作为第一个参数传入。
+
 如果 H20 节点尚无环境，安装脚本会创建或复用 conda 环境 `h20table2`。普通包和 NVIDIA 依赖固定从清华镜像安装，Torch 本体从官方 cu128 索引安装：
 
 ```bash
