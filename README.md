@@ -32,9 +32,12 @@ bash scripts/find_qs_envs.sh
 如果 H20 节点尚无环境，安装脚本会创建或复用 conda 环境 `h20table2`。普通包和 NVIDIA 依赖固定从清华镜像安装，Torch 本体从官方 cu128 索引安装：
 
 ```bash
-bash scripts/install_cu128_env.sh
+bash scripts/start_cu128_env_tmux.sh
+tmux attach -t h20-cu128-env
 conda activate h20table2
 ```
+
+安装在 tmux 后台运行，日志和最终状态分别写入 `outputs/official/install_cu128_env.log` 与 `outputs/official/install_cu128_env.status`。从 tmux 安全退出而不停止安装：先按 `Ctrl-b`，再按 `d`。
 
 然后执行：
 
