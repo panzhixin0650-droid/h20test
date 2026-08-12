@@ -97,3 +97,27 @@ H20_REPRODUCTION_OK
 - `h20_nvidia_smi_*.txt`、`h20_topology.txt`：设备状态记录。
 
 `outputs/` 默认不进入 Git。需要回传结果时，请单独传上述两份 JSON、两份正式日志、两份 smoke 日志和设备状态文件。
+
+## 独立测量 H20 带宽与 BF16 算力
+
+当 GQA kernel 的等效带宽明显低于论文 H20 Roofline 时，先运行独立硬件基线，区分节点性能与 FA3 kernel 利用率：
+
+```bash
+export GQLA_TABLE2_PYTHON="$(command -v python)"
+export GQLA_TABLE2_GPU=0
+bash scripts/run_h20_roofline.sh
+```
+
+该脚本不调用 FlashMLA、FA3 或 vLLM，默认测试：
+
+- 4 GiB Triton/SM 只读扫描，主口径只统计输入读取字节；
+- 2 GiB GPU 内连续 copy，同时报告 payload 和读加写带宽；
+- 每个张量 1 GiB 的 FP32 STREAM add，按两读一写计流量；
+- `8192/12288/16384` 三组方阵 BF16 `torch.mm`，取最高中位吞吐。
+
+默认显存峰值约 5 GiB。运行前必须确认 GPU 没有其他进程。结构化结果与完整日志分别写到：
+
+- `outputs/official/roofline/h20_hardware_roofline.json`
+- `outputs/official/roofline/h20_hardware_roofline.log`
+
+如果显存不足，可以调小 `GQLA_ROOFLINE_READ_GIB`、`GQLA_ROOFLINE_COPY_GIB` 和 `GQLA_ROOFLINE_STREAM_GIB`；正式判断建议保持默认值，使每次扫描远大于 H20 的 L2。
