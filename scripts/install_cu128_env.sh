@@ -10,7 +10,6 @@ torch_index=${GQLA_TABLE2_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
 pip_timeout=${GQLA_TABLE2_PIP_TIMEOUT:-300}
 pip_retries=${GQLA_TABLE2_PIP_RETRIES:-20}
 cuda_home=${CUDA_HOME:-/usr/local/cuda}
-flashinfer_version=${FLASHINFER_GQA_VERSION:-0.6.11.post2}
 
 if [[ "${1:-}" != --inside-conda && "${CONDA_DEFAULT_ENV:-}" != "$conda_env_name" ]]; then
     if ! command -v conda >/dev/null 2>&1; then
@@ -134,25 +133,9 @@ printf 'PyPI mirror: %s\n' "$tuna_index"
     --upgrade \
     'torch==2.11.0+cu128'
 
-"$python_bin" -m pip install "${mirror_args[@]}" \
-    "flashinfer-python==$flashinfer_version"
-
 "$python_bin" -m pip check
 "$python_bin" -c \
     'import torch; assert torch.__version__ == "2.11.0+cu128", torch.__version__; assert torch.version.cuda == "12.8", torch.version.cuda; print(f"TORCH_OK version={torch.__version__} cuda={torch.version.cuda}", flush=True)'
-"$python_bin" - "$flashinfer_version" <<'PY'
-import sys
-
-import flashinfer
-import triton
-
-assert flashinfer.__version__ == sys.argv[1], flashinfer.__version__
-assert triton.__version__ == "3.6.0", triton.__version__
-print(
-    f"FLASHINFER_OK version={flashinfer.__version__} triton={triton.__version__}",
-    flush=True,
-)
-PY
 "$python_bin" -u "$script_dir/gpu_preflight.py" \
     --expect-device-substring H20
 

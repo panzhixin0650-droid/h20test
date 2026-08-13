@@ -12,6 +12,21 @@ verify_py="$repo_root/scripts/verify_flashinfer_gqa.py"
 flashinfer_version=0.6.11.post2
 torch_version=2.11.0
 triton_version=3.6.0
+flashinfer_runtime_requirements=(
+    apache-tvm-ffi==0.1.9
+    click==8.4.1
+    cuda-tile==1.4.0
+    einops==0.8.2
+    ninja==1.13.0
+    numpy==2.3.5
+    nvidia-cudnn-frontend==1.18.0
+    nvidia-cutlass-dsl==4.5.2
+    nvidia-ml-py==13.610.43
+    packaging==26.2
+    requests==2.34.2
+    tabulate==0.10.0
+    tqdm==4.68.3
+)
 
 usage() {
     cat <<'EOF'
@@ -21,7 +36,7 @@ Usage:
 Canonical run (auto-detect H20/H100/L20Z):
   bash run_flashinfer_gqa.sh
 
-Fresh H20 node, including the pinned CUDA 12.8 environment bootstrap:
+Fresh H20 node, including an isolated pinned CUDA 12.8 environment:
   bash run_flashinfer_gqa.sh --profile h20 --bootstrap-cu128
 
 Existing PyTorch environment with FlashInfer absent:
@@ -39,7 +54,7 @@ Options:
   --no-bundle          Do not create the final tar.gz result bundle
   --allow-busy-gpu     Run even if nvidia-smi reports another compute process
   --install-missing    Install pinned FlashInfer into the selected Python env
-  --bootstrap-cu128    Build/reuse the repo's complete pinned H20 conda env
+  --bootstrap-cu128    Build/reuse the isolated flashinfer-gqa-cu128 env
   --hbm-tb-s VALUE     Override the profile's sustained HBM reference
   --bf16-tflops VALUE  Override the profile's sustained BF16 reference
   -h, --help           Show this help
@@ -162,8 +177,8 @@ if [[ "$bootstrap_cu128" == 1 ]]; then
         exit 2
     fi
     printf '%s\n' 'Bootstrapping the pinned H20 CUDA 12.8 environment...'
-    bash "$repo_root/scripts/install_cu128_env.sh"
-    conda_env_name=${GQLA_TABLE2_CONDA_ENV:-h20table2}
+    bash "$repo_root/scripts/install_flashinfer_cu128_env.sh"
+    conda_env_name=${FLASHINFER_GQA_CONDA_ENV:-flashinfer-gqa-cu128}
     conda_env_prefix=$(conda env list | \
         awk -v target="$conda_env_name" '$1 == target {print $NF; exit}')
     if [[ -z "$conda_env_prefix" || ! -x "$conda_env_prefix/bin/python" ]]; then
@@ -253,6 +268,27 @@ if [[ -z "$python_bin" && "$install_missing" == 1 ]]; then
         exit 2
     fi
     pypi_index=${FLASHINFER_GQA_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
+    selected_torch_cuda=$("$python_bin" -c 'import torch; print(torch.version.cuda)')
+    case "$selected_torch_cuda" in
+        12.8)
+            cuda_python_requirement=cuda-python==12.9.4
+            cuda_bindings_requirement=cuda-bindings==12.9.4
+            ;;
+        13.0)
+            cuda_python_requirement=cuda-python==13.0.3
+            cuda_bindings_requirement=cuda-bindings==13.0.3
+            ;;
+        *)
+            printf 'Unsupported Torch CUDA runtime for installation: %s\n' \
+                "$selected_torch_cuda" >&2
+            exit 2
+            ;;
+    esac
+    if [[ "$profile" == h20 && "$selected_torch_cuda" != 12.8 ]]; then
+        printf 'H20 requires cu128, got Torch CUDA %s; use --bootstrap-cu128.\n' \
+            "$selected_torch_cuda" >&2
+        exit 2
+    fi
     printf 'Installing FlashInfer %s into %s\n' "$flashinfer_version" "$python_bin"
     installer=()
     if "$python_bin" -m pip --version >/dev/null 2>&1; then
@@ -268,6 +304,15 @@ if [[ -z "$python_bin" && "$install_missing" == 1 ]]; then
     env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL PIP_CONFIG_FILE=/dev/null \
         "${installer[@]}" \
         --index-url "$pypi_index" \
+        "${flashinfer_runtime_requirements[@]}" \
+        "$cuda_python_requirement" \
+        "$cuda_bindings_requirement"
+    # FlashInfer leaves its Torch dependency unpinned.  Installing the core
+    # wheel with --no-deps prevents it from upgrading the selected cu128 stack.
+    env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL PIP_CONFIG_FILE=/dev/null \
+        "${installer[@]}" \
+        --index-url "$pypi_index" \
+        --no-deps \
         "flashinfer-python==$flashinfer_version"
 fi
 
@@ -336,6 +381,13 @@ esac
 if [[ "$device_name_lower" != *"${expected_device,,}"* ]]; then
     printf 'Profile %q expects a device containing %q, got %q\n' \
         "$profile" "$expected_device" "$device_name" >&2
+    exit 2
+fi
+if [[ "$profile" == h20 && "$detected_torch_cuda" != 12.8 ]]; then
+    printf 'H20 formal profile requires the cu128 Torch build; got torch=%s CUDA=%s.\n' \
+        "$detected_torch" "$detected_torch_cuda" >&2
+    printf '%s\n' \
+        'Use --bootstrap-cu128 to create the isolated flashinfer-gqa-cu128 environment.' >&2
     exit 2
 fi
 hbm_tb_s=${hbm_override:-$hbm_tb_s}

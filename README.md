@@ -173,12 +173,19 @@ bash run_flashinfer_gqa.sh \
   --install-missing
 ```
 
-全新的 H20 conda 节点可以让入口先创建/复用 `h20table2` CUDA 12.8 环境，环境
-安装和正式测速仍是一条命令；安装耗时较长，建议在 tmux 中执行：
+全新的 H20 conda 节点可以让入口先创建/复用独立的
+`flashinfer-gqa-cu128` 环境。它不会修改 `base`、`h20table2` 或同一节点上另一套
+测试正在使用的环境。FlashInfer core wheel 使用 `--no-deps` 安装，避免其未固定
+版本的 `torch` 依赖把 `2.11.0+cu128` 升级到 CUDA 13。环境安装和正式测速仍是
+一条命令；安装耗时较长，建议在 tmux 中执行：
 
 ```bash
 bash run_flashinfer_gqa.sh --profile h20 --bootstrap-cu128
 ```
+
+若同一张 GPU 正在跑另一套性能测试，一键脚本会在正式测速前拒绝运行；请等对方
+结束，或者在多卡节点上通过 `--gpu N` 选择空闲 H20。依赖环境可以各自在独立
+conda prefix 中准备，但两套正式性能测试不能共享同一张 GPU。
 
 本地只想快速检查端到端流程时可加 `--quick`。它不改变 shape 或正确性检查，
 只缩短计时窗口，结果目录会明确标记为 `quick`，不能作为正式 H20 数字。
