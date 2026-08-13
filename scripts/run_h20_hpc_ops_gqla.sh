@@ -18,7 +18,11 @@ iterations=${GQLA_HPC_OPS_ITERS:-20}
 flush_gib=${GQLA_HPC_OPS_FLUSH_GIB:-8}
 auto_install=${GQLA_HPC_OPS_AUTO_INSTALL:-1}
 keep_workdir=${GQLA_HPC_OPS_KEEP_WORKDIR:-0}
-conda_env_name=${GQLA_TABLE2_CONDA_ENV:-h20table2}
+hpc_conda_env_name=${GQLA_HPC_OPS_CONDA_ENV:-h20hpcops}
+table2_conda_env_name=${GQLA_TABLE2_CONDA_ENV:-h20table2}
+pypi_index=${GQLA_HPC_OPS_PYPI_INDEX:-${GQLA_TABLE2_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}}
+pip_timeout=${GQLA_HPC_OPS_PIP_TIMEOUT:-${GQLA_TABLE2_PIP_TIMEOUT:-300}}
+pip_retries=${GQLA_HPC_OPS_PIP_RETRIES:-${GQLA_TABLE2_PIP_RETRIES:-20}}
 cuda_home=${CUDA_HOME:-/usr/local/cuda}
 run_id=$(date -u +%Y%m%dT%H%M%SZ)_$$
 run_dir="$output_root/runs/hpc_ops_gqla_h20_$run_id"
@@ -56,9 +60,10 @@ python_has_torch() {
 }
 
 find_conda_python() {
+    local env_name=$1
     local prefix
     command -v conda >/dev/null 2>&1 || return 1
-    prefix=$(conda env list | awk -v target="$conda_env_name" \
+    prefix=$(conda env list | awk -v target="$env_name" \
         '$1 == target {print $NF; exit}')
     [[ -n "$prefix" && -x "$prefix/bin/python" ]] || return 1
     printf '%s\n' "$prefix/bin/python"
@@ -70,6 +75,10 @@ resolve_python() {
         printf '%s\n' "$GQLA_HPC_OPS_PYTHON"
         return 0
     fi
+    if candidate=$(find_conda_python "$hpc_conda_env_name") && python_has_torch "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
     if [[ -n "${GQLA_TABLE2_PYTHON:-}" ]]; then
         printf '%s\n' "$GQLA_TABLE2_PYTHON"
         return 0
@@ -78,7 +87,7 @@ resolve_python() {
         printf '%s\n' "$VIRTUAL_ENV/bin/python"
         return 0
     fi
-    if candidate=$(find_conda_python) && python_has_torch "$candidate"; then
+    if candidate=$(find_conda_python "$table2_conda_env_name") && python_has_torch "$candidate"; then
         printf '%s\n' "$candidate"
         return 0
     fi
@@ -94,8 +103,94 @@ resolve_python() {
     return 1
 }
 
+python_cuda_release() {
+    local candidate=$1
+    "$candidate" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null
+}
+
+python_matches_toolkit_major() {
+    local candidate=$1
+    local torch_cuda
+    local torch_cuda_major
+    torch_cuda=$(python_cuda_release "$candidate") || return 1
+    torch_cuda_major=${torch_cuda%%.*}
+    [[ -n "$torch_cuda_major" && "$torch_cuda_major" == "$cuda_major" ]]
+}
+
+bootstrap_hpc_environment() {
+    GQLA_TABLE2_CONDA_ENV="$hpc_conda_env_name" \
+    GQLA_TABLE2_PYPI_INDEX="$pypi_index" \
+    GQLA_TABLE2_PIP_TIMEOUT="$pip_timeout" \
+    GQLA_TABLE2_PIP_RETRIES="$pip_retries" \
+    CUDA_VISIBLE_DEVICES="$visible_gpu" \
+    CUDA_HOME="$cuda_home" \
+        bash "$script_dir/install_cu128_env.sh"
+    hpc_python=$(find_conda_python "$hpc_conda_env_name")
+}
+
+cmake_is_usable() {
+    local cmake_version
+    command -v cmake >/dev/null 2>&1 || return 1
+    cmake_version=$(cmake --version | sed -n '1s/^cmake version //p')
+    [[ -n "$cmake_version" ]] || return 1
+    "$hpc_python" - "$cmake_version" <<'PY'
+import sys
+
+parts = sys.argv[1].split(".")
+version = tuple(int(part) for part in parts[:2])
+raise SystemExit(0 if version >= (3, 26) else 1)
+PY
+}
+
+build_tools_are_usable() {
+    "$hpc_python" -c 'import setuptools, wheel' >/dev/null 2>&1 && \
+        cmake_is_usable && command -v ninja >/dev/null 2>&1
+}
+
+ensure_build_tools() {
+    if build_tools_are_usable; then
+        return 0
+    fi
+    if [[ "$auto_install" == 0 ]]; then
+        printf '%s\n' \
+            'HPC-Ops requires cmake>=3.26, ninja, wheel, and setuptools.' \
+            'Install them in the selected Python environment or enable GQLA_HPC_OPS_AUTO_INSTALL=1.' >&2
+        return 2
+    fi
+    printf 'Installing missing HPC-Ops build tools into %s...\n' "$hpc_python"
+    env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL \
+        PIP_CONFIG_FILE=/dev/null \
+        "$hpc_python" -m pip install \
+            --index-url "$pypi_index" \
+            --timeout "$pip_timeout" \
+            --retries "$pip_retries" \
+            --prefer-binary \
+            --upgrade \
+            'cmake>=3.26,<4' \
+            ninja \
+            wheel \
+            'setuptools<82'
+    hash -r
+    if ! build_tools_are_usable; then
+        printf 'Build-tool installation completed but validation still failed.\n' >&2
+        return 1
+    fi
+}
+
 printf 'Run ID: %s\n' "$run_id"
 printf 'Output directory: %s\n' "$run_dir"
+
+if [[ ! -x "$cuda_home/bin/nvcc" ]]; then
+    printf 'nvcc is absent: %s/bin/nvcc\n' "$cuda_home" >&2
+    exit 2
+fi
+cuda_release=$("$cuda_home/bin/nvcc" --version | \
+    sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n 1)
+if [[ -z "$cuda_release" ]]; then
+    printf 'Unable to parse nvcc release from %s/bin/nvcc\n' "$cuda_home" >&2
+    exit 2
+fi
+cuda_major=${cuda_release%%.*}
 
 if ! hpc_python=$(resolve_python); then
     if [[ "$auto_install" == 0 ]]; then
@@ -104,25 +199,45 @@ if ! hpc_python=$(resolve_python); then
             'Set GQLA_HPC_OPS_PYTHON or rerun with GQLA_HPC_OPS_AUTO_INSTALL=1.' >&2
         exit 2
     fi
-    printf 'No usable environment found; creating/reusing conda env %s.\n' "$conda_env_name"
-    GQLA_TABLE2_CONDA_ENV="$conda_env_name" \
-        bash "$script_dir/install_cu128_env.sh"
-    hpc_python=$(find_conda_python)
+    printf 'No usable environment found; creating/reusing isolated conda env %s.\n' \
+        "$hpc_conda_env_name"
+    bootstrap_hpc_environment
 fi
 
 if ! python_has_torch "$hpc_python"; then
-    printf 'Selected Python cannot import torch: %s\n' "$hpc_python" >&2
-    exit 2
+    if [[ "$auto_install" == 0 ]]; then
+        printf 'Selected Python cannot import torch: %s\n' "$hpc_python" >&2
+        exit 2
+    fi
+    printf 'Selected Python cannot import torch; using isolated env %s.\n' \
+        "$hpc_conda_env_name"
+    bootstrap_hpc_environment
+fi
+torch_cuda_release=$(python_cuda_release "$hpc_python")
+if ! python_matches_toolkit_major "$hpc_python"; then
+    if [[ "$auto_install" == 0 ]]; then
+        printf 'Selected Python has torch CUDA %s but nvcc is CUDA %s.\n' \
+            "${torch_cuda_release:-unknown}" "$cuda_release" >&2
+        printf 'Use a matching environment or enable GQLA_HPC_OPS_AUTO_INSTALL=1.\n' >&2
+        exit 2
+    fi
+    printf 'Selected Python has torch CUDA %s but nvcc is CUDA %s; using isolated env %s.\n' \
+        "${torch_cuda_release:-unknown}" "$cuda_release" "$hpc_conda_env_name"
+    bootstrap_hpc_environment
+    if ! python_matches_toolkit_major "$hpc_python"; then
+        printf 'The isolated environment still does not match nvcc CUDA %s.\n' \
+            "$cuda_release" >&2
+        exit 2
+    fi
 fi
 export PATH="$(dirname -- "$hpc_python"):$cuda_home/bin:$PATH"
 export CUDA_HOME="$cuda_home"
 export CUDA_VISIBLE_DEVICES="$visible_gpu"
 export PYTHONUNBUFFERED=1
 
-test -x "$cuda_home/bin/nvcc"
 command -v git >/dev/null
-command -v cmake >/dev/null
 command -v nvidia-smi >/dev/null
+ensure_build_tools
 "$hpc_python" -c 'import setuptools, torch, wheel; print(f"Python/Torch: {torch.__version__} CUDA={torch.version.cuda}", flush=True)'
 cmake --version
 "$cuda_home/bin/nvcc" --version

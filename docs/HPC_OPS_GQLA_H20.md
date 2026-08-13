@@ -37,10 +37,17 @@ bash scripts/run_h20_hpc_ops_gqla.sh
 5. 正式测量 `B=128, L=8192` 下的四组 `H_KV/S_Q` 组合；
 6. 发布单独的 Markdown、CSV 和 JSON 表。
 
-环境解析顺序是 `GQLA_HPC_OPS_PYTHON`、`GQLA_TABLE2_PYTHON`、当前 venv、
-conda 环境 `h20table2`、仓库 `.venv`、系统 `python3`。如果都不可用，默认会调用
-仓库现有的 `install_cu128_env.sh` 创建 `h20table2`；设
-`GQLA_HPC_OPS_AUTO_INSTALL=0` 可以关闭自动安装。
+环境解析顺序是 `GQLA_HPC_OPS_PYTHON`、conda 环境 `h20hpcops`、
+`GQLA_TABLE2_PYTHON`、当前 venv、conda 环境 `h20table2`、仓库 `.venv`、系统
+`python3`。脚本会比较 `torch.version.cuda` 和 `nvcc` 的 CUDA major，并要求两者
+一致；还会验证 `cmake>=3.26`、Ninja、wheel 和 setuptools。
+
+如果没有兼容环境，或共享的 `h20table2` 已被其他 benchmark 升级成 cu130、但
+H20 节点的 `/usr/local/cuda` 仍为 12.8，脚本会调用
+现有的 `install_cu128_env.sh`、但把目标环境名覆盖为隔离的 `h20hpcops`。该环境
+固定为 PyTorch `2.11.0+cu128`，不安装 FlashInfer，也不会修改 `h20table2`。
+缺少的 CMake 等构建工具也会自动安装到最终选中的环境中。设
+`GQLA_HPC_OPS_AUTO_INSTALL=0` 可以关闭这些自动修复。
 
 正式结果固定发布到：
 
