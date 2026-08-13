@@ -221,8 +221,9 @@ def markdown_section(rows: list[dict], hpc_reports: dict[str, dict]) -> str:
     lines.extend(
         [
             "",
-            "† `(g=4, s_q=2)` 当前走 M64 specialization，明确保留后续优化空间；"
-            "本表使用本轮原始实测，不对结果做估算或修正。",
+            "† `(g=4, s_q=2)` 明确保留后续优化空间：TP=1/2/4 的 local head "
+            "ratio 为 32，走 M64 specialization；TP=8 因 KV 复制使 local ratio "
+            "变为 16，转用 M32。本表使用本轮原始实测，不做估算或修正。",
             "",
             "### 实测硬件带宽与算力",
             "",

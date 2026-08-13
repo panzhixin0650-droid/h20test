@@ -287,8 +287,9 @@ def write_markdown(path: Path, report: dict, rows: list[dict], provenance: dict)
             "",
             "物理理论使用本机独立实测带宽/算力与 HPC-Ops 实际的 "
             "`K[...,H_KV,192] + V[...,H_KV,128]` BF16 payload。",
-            "`(g=4, s_q=2)` 使用 M64 specialization；该组合明确保留后续寄存器、"
-            "shared-memory 驻留与 pipeline 优化空间，当前实测值不做修正。",
+            "`(g=4, s_q=2)` 明确保留优化空间：TP=1/2/4 的 local head ratio "
+            "仍为 32，使用 M64 specialization；TP=8 因 KV 复制使 local ratio "
+            "变为 16，转用 M32。当前实测值均不做修正。",
             "",
         ]
     )
