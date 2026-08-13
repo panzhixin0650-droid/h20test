@@ -16,6 +16,10 @@ seqlen=${GQLA_HPC_OPS_SEQLEN:-8192}
 warmup=${GQLA_HPC_OPS_WARMUP:-5}
 iterations=${GQLA_HPC_OPS_ITERS:-20}
 flush_gib=${GQLA_HPC_OPS_FLUSH_GIB:-8}
+table2_hbm_tb_s=${GQLA_TABLE2_H20_HBM_TB_S:-4.0}
+table2_bf16_tflops=${GQLA_TABLE2_H20_BF16_TFLOPS:-148.0}
+h20_measured_hbm_tb_s=${GQLA_H20_MEASURED_HBM_TB_S:-3.572}
+h20_measured_bf16_tflops=${GQLA_H20_MEASURED_BF16_TFLOPS:-141.48}
 auto_install=${GQLA_HPC_OPS_AUTO_INSTALL:-1}
 keep_workdir=${GQLA_HPC_OPS_KEEP_WORKDIR:-0}
 hpc_conda_env_name=${GQLA_HPC_OPS_CONDA_ENV:-h20hpcops}
@@ -319,7 +323,11 @@ printf 'Running B=%s L=%s HPC-Ops GQLA benchmark...\n' "$batch" "$seqlen"
     --base-commit "$base_commit" \
     --patched-commit "$patched_commit" \
     --patch-sha256 "$patch_sha256" \
-    --run-id "$run_id"
+    --run-id "$run_id" \
+    --table2-hbm-tb-s "$table2_hbm_tb_s" \
+    --table2-bf16-tflops "$table2_bf16_tflops" \
+    --h20-measured-hbm-tb-s "$h20_measured_hbm_tb_s" \
+    --h20-measured-bf16-tflops "$h20_measured_bf16_tflops"
 
 install -m 0644 "$published_json" "$output_root/hpc_ops_gqla_h20.json"
 install -m 0644 "$table_csv" "$output_root/hpc_ops_gqla_h20.csv"
