@@ -177,7 +177,8 @@ if [[ "$bootstrap_cu128" == 1 ]]; then
         exit 2
     fi
     printf '%s\n' 'Bootstrapping the pinned H20 CUDA 12.8 environment...'
-    bash "$repo_root/scripts/install_flashinfer_cu128_env.sh"
+    CUDA_VISIBLE_DEVICES="$gpu_index" \
+        bash "$repo_root/scripts/install_flashinfer_cu128_env.sh"
     conda_env_name=${FLASHINFER_GQA_CONDA_ENV:-flashinfer-gqa-cu128}
     conda_env_prefix=$(conda env list | \
         awk -v target="$conda_env_name" '$1 == target {print $NF; exit}')
