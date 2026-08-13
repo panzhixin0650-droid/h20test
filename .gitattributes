@@ -1,0 +1,2 @@
+# Unified-diff context and signature markers intentionally end in spaces.
+patches/*.patch -whitespace
