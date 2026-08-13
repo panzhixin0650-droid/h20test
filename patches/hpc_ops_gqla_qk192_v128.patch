@@ -1,25 +1,41 @@
-From d48b0dda744b05a4620b7db05e0f472aad1cb06f Mon Sep 17 00:00:00 2001
+From 83165c3f7d1f2a4aa0bd1f8c0f37fab771b5190b Mon Sep 17 00:00:00 2001
 From: panzhixin0650-droid <panzhixin0650-droid@users.noreply.github.com>
 Date: Thu, 13 Aug 2026 12:27:31 +0800
 Subject: [PATCH] Add GQLA QK192 V128 BF16 decode support
 
+---
+ benchmark/attention_decode/README.md          |  24 ++
+ .../bench_attention_decode_bf16_gqla.py       | 362 ++++++++++++++++++
+ hpc/attention.py                              |  12 +-
+ src/attention/decode/decode.cc                |  11 +-
+ .../sm90/static/smallm_bf16_dim128_static.cu  |  76 +++-
+ src/attention/decode/sm90/util_kernels.cuh    |  38 ++
+ src/attention/decode/smallm_dim128.h          |   9 +
+ src/attention/entry.cc                        |  39 +-
+ tests/test_attention_decode_bf16_gqla.py      | 215 +++++++++++
+ 9 files changed, 772 insertions(+), 14 deletions(-)
+ create mode 100644 benchmark/attention_decode/bench_attention_decode_bf16_gqla.py
+ create mode 100644 tests/test_attention_decode_bf16_gqla.py
 
 diff --git a/benchmark/attention_decode/README.md b/benchmark/attention_decode/README.md
-index b0a8137..c61ce75 100644
+index b0a8137..4821ae4 100644
 --- a/benchmark/attention_decode/README.md
 +++ b/benchmark/attention_decode/README.md
-@@ -58,6 +58,27 @@ python3 benchmark/attention_decode/bench_attention_decode_fp8.py \
+@@ -58,6 +58,30 @@ python3 benchmark/attention_decode/bench_attention_decode_fp8.py \
  
  Enable correctness comparison between static and dynamic paths with `--check`.
  
 +## GQLA BF16 (`QK=192`, `V=128`)
 +
-+`bench_attention_decode_bf16_gqla.py` covers the four GQLA decode shapes with
-+`B=128`, `L=8192`, `Hq=128`, `Hkv={8,4}`, `Sq={1,2}`, and `block_size=64`.
-+It reports whole-call latency, latency divided by batch, aggregate query-token
-+throughput, and physical KV-payload bandwidth. By default an 8 GiB buffer is
-+written before each timed call to evict L2 without including that write in the
-+CUDA-event interval.
++`bench_attention_decode_bf16_gqla.py` covers the GQLA Table 2 TP sweep with
++`B=128`, `L=8192`, global `Hq=128`, global `Hkv={8,4}`, `Sq={1,2}`,
++`TP={1,2,4,8}`, and `block_size=64`. One GPU executes the rank-local shape
++`Hq_local=128/TP`, `Hkv_local=max(Hkv_global/TP,1)`; no collective is timed and
++query-token throughput is not multiplied by TP. It reports whole-call latency,
++latency divided by batch, a separately profiled main-kernel latency, aggregate
++query-token throughput, and physical KV-payload bandwidth. By default an 8 GiB
++buffer is written before each timed or profiled call to evict L2 without
++including that write in the CUDA-event interval or main-kernel duration.
 +
 +```bash
 +python3 benchmark/attention_decode/bench_attention_decode_bf16_gqla.py \
@@ -30,7 +46,7 @@ index b0a8137..c61ce75 100644
 +The `static` mode disables split-K and is the intended first choice for the
 +uniform `B=128`, `L=8192` workload. `static-splitk` is included for direct A/B
 +measurements. The GQLA shape extension currently does not accept a dynamic
-+`task_map` and forces single-split execution for all four shapes even when
++`task_map` and forces single-split execution for every TP shape even when
 +`static-splitk` is requested.
 +
  ## BF16
@@ -38,18 +54,21 @@ index b0a8137..c61ce75 100644
  - Operator: SM90 Attention Decode BF16
 diff --git a/benchmark/attention_decode/bench_attention_decode_bf16_gqla.py b/benchmark/attention_decode/bench_attention_decode_bf16_gqla.py
 new file mode 100644
-index 0000000..94d6770
+index 0000000..9e4feea
 --- /dev/null
 +++ b/benchmark/attention_decode/bench_attention_decode_bf16_gqla.py
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,362 @@
 +# Copyright 2026 hpc-ops authors
 +
-+"""Benchmark the GQLA QK=192/V=128 BF16 paged-decode path.
++"""Benchmark the GQLA QK=192/V=128 BF16 paged-decode TP sweep.
 +
-+The default workload matches the GQLA FA3 measurements: B=128, L=8192,
-+Hq=128, Hkv in {8, 4}, Sq in {1, 2}, BF16, and a 64-token page.  CUDA-event
-+latency covers one complete operator call; ``us_per_sequence`` divides that
-+latency by the batch size, matching the reporting convention used by GQLA.
++The default workload matches the GQLA Table 2 protocol: B=128, L=8192,
++global Hq=128, global Hkv in {8, 4}, Sq in {1, 2}, TP in {1, 2, 4, 8},
++BF16, and a 64-token page.  One GPU executes a balanced rank-local shape:
++Hq_local=128/TP and Hkv_local=max(Hkv_global/TP, 1).  This intentionally
++does not include NCCL.  CUDA-event latency covers one complete operator call;
++``us_per_sequence`` divides that latency by the batch size, matching GQLA's
++reporting convention.  A separate Kineto pass reports the main CUDA kernel.
 +"""
 +
 +from __future__ import annotations
@@ -71,21 +90,44 @@ index 0000000..94d6770
 +
 +
 +BLOCK_SIZE = 64
-+NUM_HEAD_Q = 128
++GLOBAL_NUM_HEAD_Q = 128
 +QK_DIM = 192
 +V_DIM = 128
-+CASES = ((8, 1), (8, 2), (4, 1), (4, 2))
++GLOBAL_NUM_HEAD_KV = (8, 4)
++NUM_SEQ_Q = (1, 2)
++TP_SIZES = (1, 2, 4, 8)
 +MODES = ("static", "static-splitk")
 +
 +
-+def make_inputs(batch: int, seqlen: int, num_head_kv: int, num_seq_q: int):
++def tp_cases():
++    for global_num_head_kv in GLOBAL_NUM_HEAD_KV:
++        for num_seq_q in NUM_SEQ_Q:
++            for tp_size in TP_SIZES:
++                yield {
++                    "global_num_head_kv": global_num_head_kv,
++                    "num_seq_q": num_seq_q,
++                    "tp_size": tp_size,
++                    "local_num_head_q": GLOBAL_NUM_HEAD_Q // tp_size,
++                    "local_num_head_kv": max(global_num_head_kv // tp_size, 1),
++                    "kv_replication_factor": max(tp_size // global_num_head_kv, 1),
++                }
++
++
++def make_inputs(
++    batch: int,
++    seqlen: int,
++    num_head_q: int,
++    num_head_kv: int,
++    num_seq_q: int,
++    seed: int,
++):
 +    pages_per_sequence = math.ceil(seqlen / BLOCK_SIZE)
 +    total_blocks = batch * pages_per_sequence
 +
-+    torch.manual_seed(2026 + num_head_kv * 10 + num_seq_q)
-+    torch.cuda.manual_seed_all(2026 + num_head_kv * 10 + num_seq_q)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
 +    q = torch.randn(
-+        (batch * num_seq_q, NUM_HEAD_Q, QK_DIM),
++        (batch * num_seq_q, num_head_q, QK_DIM),
 +        dtype=torch.bfloat16,
 +        device="cuda",
 +    )
@@ -104,7 +146,7 @@ index 0000000..94d6770
 +    )
 +    total_lens = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
 +    output = torch.empty(
-+        (batch * num_seq_q, NUM_HEAD_Q, V_DIM),
++        (batch * num_seq_q, num_head_q, V_DIM),
 +        dtype=torch.bfloat16,
 +        device="cuda",
 +    )
@@ -150,8 +192,85 @@ index 0000000..94d6770
 +    return float(median(samples))
 +
 +
-+def run_case(args, mode: str, num_head_kv: int, num_seq_q: int, flush):
-+    inputs = make_inputs(args.batch, args.seqlen, num_head_kv, num_seq_q)
++def profile_main_kernel(call, calls: int, flush: torch.Tensor | None) -> dict:
++    """Profile cold-cache operator kernels while excluding the flush kernel."""
++    activities = [
++        torch.profiler.ProfilerActivity.CPU,
++        torch.profiler.ProfilerActivity.CUDA,
++    ]
++    cuda_device_type = torch.autograd.DeviceType.CUDA
++
++    def cuda_rows(profiler, allowed_names=None):
++        rows = []
++        for event in profiler.key_averages():
++            if event.device_type != cuda_device_type:
++                continue
++            name = str(event.key)
++            if allowed_names is not None and name not in allowed_names:
++                continue
++            total_us = float(event.self_device_time_total)
++            if total_us <= 0:
++                continue
++            count = int(event.count)
++            rows.append(
++                {
++                    "name": name,
++                    "count": count,
++                    "invocations_per_call": count / calls,
++                    "sum_us_per_call": total_us / calls,
++                    "mean_us_per_invocation": total_us / count,
++                }
++            )
++        rows.sort(key=lambda row: row["sum_us_per_call"], reverse=True)
++        return rows
++
++    torch.cuda.synchronize()
++    with torch.profiler.profile(activities=activities) as discovery_profiler:
++        for _ in range(calls):
++            call()
++        torch.cuda.synchronize()
++    discovered_rows = cuda_rows(discovery_profiler)
++    discovered_names = {row["name"] for row in discovered_rows}
++    if not discovered_names:
++        raise RuntimeError("Kineto discovered no CUDA kernels for the operator")
++
++    torch.cuda.synchronize()
++    with torch.profiler.profile(activities=activities) as measured_profiler:
++        for _ in range(calls):
++            if flush is not None:
++                flush.zero_()
++            call()
++        torch.cuda.synchronize()
++    rows = cuda_rows(measured_profiler, discovered_names)
++    if not rows:
++        raise RuntimeError("Kineto measured no operator CUDA kernels after L2 flush")
++
++    main = max(rows, key=lambda row: row["sum_us_per_call"])
++    return {
++        "calls": calls,
++        "flush_l2": flush is not None,
++        "main_kernel_name": main["name"],
++        "main_kernel_us": main["sum_us_per_call"],
++        "kernel_sum_us": sum(row["sum_us_per_call"] for row in rows),
++        "kernels": rows,
++    }
++
++
++def run_case(args, mode: str, case: dict, flush):
++    global_num_head_kv = case["global_num_head_kv"]
++    num_seq_q = case["num_seq_q"]
++    tp_size = case["tp_size"]
++    local_num_head_q = case["local_num_head_q"]
++    local_num_head_kv = case["local_num_head_kv"]
++    seed = 2026 + global_num_head_kv * 100 + num_seq_q * 10 + tp_size
++    inputs = make_inputs(
++        args.batch,
++        args.seqlen,
++        local_num_head_q,
++        local_num_head_kv,
++        num_seq_q,
++        seed,
++    )
 +    call = make_call(mode, inputs, num_seq_q)
 +    call()
 +    torch.cuda.synchronize()
@@ -159,19 +278,23 @@ index 0000000..94d6770
 +        raise RuntimeError("decode output contains NaN or Inf")
 +
 +    call_us = benchmark_us(call, args.warmup, args.iters, flush)
++    profile = profile_main_kernel(call, args.profile_calls, flush)
 +    payload_bytes = (
 +        args.batch
 +        * args.seqlen
-+        * num_head_kv
++        * local_num_head_kv
 +        * (QK_DIM + V_DIM)
 +        * torch.tensor([], dtype=torch.bfloat16).element_size()
 +    )
 +    result = {
 +        "mode": mode,
-+        "num_head_kv": num_head_kv,
++        **case,
 +        "num_seq_q": num_seq_q,
 +        "call_us": call_us,
 +        "us_per_sequence": call_us / args.batch,
++        "main_kernel_us": profile["main_kernel_us"],
++        "main_us_per_sequence": profile["main_kernel_us"] / args.batch,
++        "kernel_profile": profile,
 +        "query_tokens_per_second": args.batch * num_seq_q * 1e6 / call_us,
 +        "physical_kv_payload_bytes": payload_bytes,
 +        "physical_kv_payload_tb_s": payload_bytes / call_us / 1e6,
@@ -188,6 +311,12 @@ index 0000000..94d6770
 +    parser.add_argument("--seqlen", type=int, default=8192)
 +    parser.add_argument("--warmup", type=int, default=5)
 +    parser.add_argument("--iters", type=int, default=20)
++    parser.add_argument(
++        "--profile-calls",
++        type=int,
++        default=10,
++        help="Kineto calls used to report the cold-cache main CUDA kernel",
++    )
 +    parser.add_argument(
 +        "--modes",
 +        nargs="+",
@@ -210,7 +339,13 @@ index 0000000..94d6770
 +
 +def main():
 +    args = parse_args()
-+    if args.batch <= 0 or args.seqlen < 2 or args.warmup < 0 or args.iters <= 0:
++    if (
++        args.batch <= 0
++        or args.seqlen < 2
++        or args.warmup < 0
++        or args.iters <= 0
++        or args.profile_calls <= 0
++    ):
 +        raise ValueError("batch/iters must be positive, seqlen >= 2, and warmup >= 0")
 +    if args.flush_gib < 0:
 +        raise ValueError("flush-gib must be non-negative")
@@ -231,29 +366,48 @@ index 0000000..94d6770
 +        "hpc_ops": hpc.__version__,
 +        "batch": args.batch,
 +        "seqlen": args.seqlen,
-+        "num_head_q": NUM_HEAD_Q,
++        "num_head_q": GLOBAL_NUM_HEAD_Q,
++        "global_num_head_q": GLOBAL_NUM_HEAD_Q,
++        "global_num_head_kv": list(GLOBAL_NUM_HEAD_KV),
++        "tp_sizes": list(TP_SIZES),
 +        "qk_dim": QK_DIM,
 +        "v_dim": V_DIM,
 +        "block_size": BLOCK_SIZE,
 +        "flush_gib": args.flush_gib,
 +        "warmup_iterations": args.warmup,
 +        "measured_iterations": args.iters,
++        "profile_calls": args.profile_calls,
 +        "latency_statistic": "median CUDA-event time for one complete operator call",
++        "main_latency_statistic": "mean Kineto duration of the dominant CUDA kernel in separately profiled cold-cache calls",
++        "tp_simulation_semantics": (
++            "One GPU executes the rank-local attention tensors for a balanced "
++            "representative TP rank. Q heads are 128/TP. GQA local KV heads are "
++            "max(g/TP, 1), with KV replication when TP>g. No NCCL or other "
++            "collectives are included. Global query-token throughput equals "
++            "B*s_q/full_call_us and is not multiplied by TP."
++        ),
 +        "results": [],
 +    }
 +
 +    print(
 +        f"device={props.name} sm={props.major}.{props.minor} "
-+        f"B={args.batch} L={args.seqlen} Hq={NUM_HEAD_Q} QK={QK_DIM} V={V_DIM}"
++        f"B={args.batch} L={args.seqlen} global_Hq={GLOBAL_NUM_HEAD_Q} "
++        f"QK={QK_DIM} V={V_DIM}"
 +    )
-+    print("mode            Hkv Sq  call_us  us/sequence  query_tok/s  payload_TB/s")
++    print(
++        "mode             g Sq TP local_Hq local_Hkv  call_us  main_us  "
++        "us/sequence  query_tok/s  payload_TB/s"
++    )
 +    for mode in args.modes:
-+        for num_head_kv, num_seq_q in CASES:
-+            result = run_case(args, mode, num_head_kv, num_seq_q, flush)
++        for case in tp_cases():
++            result = run_case(args, mode, case, flush)
 +            report["results"].append(result)
 +            print(
-+                f"{mode:<16} {num_head_kv:>3} {num_seq_q:>2} "
-+                f"{result['call_us']:>8.2f} {result['us_per_sequence']:>12.3f} "
++                f"{mode:<16} {case['global_num_head_kv']:>2} "
++                f"{case['num_seq_q']:>2} {case['tp_size']:>2} "
++                f"{case['local_num_head_q']:>8} {case['local_num_head_kv']:>9} "
++                f"{result['call_us']:>8.2f} {result['main_kernel_us']:>8.2f} "
++                f"{result['us_per_sequence']:>12.3f} "
 +                f"{result['query_tokens_per_second']:>12.1f} "
 +                f"{result['physical_kv_payload_tb_s']:>12.3f}"
 +            )
@@ -598,10 +752,10 @@ index e4e1e6c..8af1c5c 100644
    auto *kcache_ptr = kcache.mutable_data_ptr();
 diff --git a/tests/test_attention_decode_bf16_gqla.py b/tests/test_attention_decode_bf16_gqla.py
 new file mode 100644
-index 0000000..07c650c
+index 0000000..0f977b9
 --- /dev/null
 +++ b/tests/test_attention_decode_bf16_gqla.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,215 @@
 +# Copyright 2026 hpc-ops authors
 +
 +"""Correctness coverage for the GQLA BF16 decode shapes."""
@@ -621,14 +775,20 @@ index 0000000..07c650c
 +
 +
 +BLOCK_SIZE = 64
-+NUM_HEAD_Q = 128
++GLOBAL_NUM_HEAD_Q = 128
 +QK_DIM = 192
 +V_DIM = 128
++TP_CASES = tuple(
++    (global_num_head_kv, num_seq_q, tp_size)
++    for global_num_head_kv in (8, 4)
++    for num_seq_q in (1, 2)
++    for tp_size in (1, 2, 4, 8)
++)
 +
 +
-+def _make_inputs(num_head_kv: int, num_seq_q: int):
-+    torch.manual_seed(2026 + num_head_kv * 10 + num_seq_q)
-+    torch.cuda.manual_seed_all(2026 + num_head_kv * 10 + num_seq_q)
++def _make_inputs(num_head_q: int, num_head_kv: int, num_seq_q: int, seed: int):
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
 +
 +    total_lens = torch.tensor([70, 129], dtype=torch.int32, device="cuda")
 +    num_batch = total_lens.numel()
@@ -636,7 +796,7 @@ index 0000000..07c650c
 +    total_blocks = int(num_blocks.sum().item())
 +
 +    q = torch.randn(
-+        (num_batch * num_seq_q, NUM_HEAD_Q, QK_DIM),
++        (num_batch * num_seq_q, num_head_q, QK_DIM),
 +        dtype=torch.bfloat16,
 +        device="cuda",
 +    )
@@ -667,12 +827,14 @@ index 0000000..07c650c
 +    return q, kcache, vcache, block_ids, total_lens
 +
 +
-+def _reference(q, kcache, vcache, block_ids, total_lens, num_head_kv, num_seq_q):
++def _reference(
++    q, kcache, vcache, block_ids, total_lens, num_head_q, num_head_kv, num_seq_q
++):
 +    num_batch = total_lens.numel()
-+    heads_per_group = NUM_HEAD_Q // num_head_kv
-+    q = q.reshape(num_batch, num_seq_q, NUM_HEAD_Q, QK_DIM)
++    heads_per_group = num_head_q // num_head_kv
++    q = q.reshape(num_batch, num_seq_q, num_head_q, QK_DIM)
 +    output = torch.empty(
-+        (num_batch, num_seq_q, NUM_HEAD_Q, V_DIM),
++        (num_batch, num_seq_q, num_head_q, V_DIM),
 +        dtype=torch.float32,
 +        device="cuda",
 +    )
@@ -695,18 +857,36 @@ index 0000000..07c650c
 +        probabilities = torch.softmax(scores.masked_fill(~causal_mask, -torch.inf), dim=-1)
 +        output[batch_idx] = torch.matmul(probabilities, v).transpose(0, 1)
 +
-+    return output.reshape(num_batch * num_seq_q, NUM_HEAD_Q, V_DIM).to(torch.bfloat16)
++    return output.reshape(num_batch * num_seq_q, num_head_q, V_DIM).to(torch.bfloat16)
 +
 +
-+def _run_case(num_head_kv: int, num_seq_q: int, splitk: bool, use_output: bool = True):
-+    q, kcache, vcache, block_ids, total_lens = _make_inputs(num_head_kv, num_seq_q)
++def _run_case(
++    global_num_head_kv: int,
++    num_seq_q: int,
++    tp_size: int,
++    splitk: bool,
++    use_output: bool = True,
++):
++    local_num_head_q = GLOBAL_NUM_HEAD_Q // tp_size
++    local_num_head_kv = max(global_num_head_kv // tp_size, 1)
++    seed = 2026 + global_num_head_kv * 100 + num_seq_q * 10 + tp_size
++    q, kcache, vcache, block_ids, total_lens = _make_inputs(
++        local_num_head_q, local_num_head_kv, num_seq_q, seed
++    )
 +    expected = _reference(
-+        q, kcache, vcache, block_ids, total_lens, num_head_kv, num_seq_q
++        q,
++        kcache,
++        vcache,
++        block_ids,
++        total_lens,
++        local_num_head_q,
++        local_num_head_kv,
++        num_seq_q,
 +    )
 +    kwargs = {}
 +    if use_output:
 +        kwargs["output"] = torch.empty(
-+            (q.size(0), NUM_HEAD_Q, V_DIM), dtype=torch.bfloat16, device="cuda"
++            (q.size(0), local_num_head_q, V_DIM), dtype=torch.bfloat16, device="cuda"
 +        )
 +
 +    actual = hpc.attention_decode_bf16(
@@ -724,29 +904,37 @@ index 0000000..07c650c
 +
 +    if use_output:
 +        assert actual.data_ptr() == kwargs["output"].data_ptr()
-+    assert actual.shape == (q.size(0), NUM_HEAD_Q, V_DIM)
++    assert actual.shape == (q.size(0), local_num_head_q, V_DIM)
 +    assert torch.isfinite(actual).all()
 +    torch.testing.assert_close(actual.float(), expected.float(), atol=0.02, rtol=0.02)
 +
 +
-+@pytest.mark.parametrize("num_head_kv,num_seq_q", [(8, 1), (8, 2), (4, 1), (4, 2)])
-+def test_gqla_qk192_v128_static(num_head_kv, num_seq_q):
-+    _run_case(num_head_kv, num_seq_q, splitk=False)
++@pytest.mark.parametrize("global_num_head_kv,num_seq_q,tp_size", TP_CASES)
++def test_gqla_qk192_v128_static(global_num_head_kv, num_seq_q, tp_size):
++    _run_case(global_num_head_kv, num_seq_q, tp_size, splitk=False)
 +
 +
 +@pytest.mark.parametrize("num_head_kv,num_seq_q", [(8, 1), (4, 2)])
 +def test_gqla_splitk_hint_falls_back_to_single_split(num_head_kv, num_seq_q):
-+    _run_case(num_head_kv, num_seq_q, splitk=True)
++    _run_case(num_head_kv, num_seq_q, 1, splitk=True)
 +
 +
 +def test_gqla_allocates_v_sized_output():
-+    _run_case(num_head_kv=8, num_seq_q=1, splitk=False, use_output=False)
++    _run_case(
++        global_num_head_kv=8,
++        num_seq_q=1,
++        tp_size=1,
++        splitk=False,
++        use_output=False,
++    )
 +
 +
 +def test_gqla_rejects_dynamic_task_map():
 +    num_head_kv = 8
 +    num_seq_q = 1
-+    q, kcache, vcache, block_ids, total_lens = _make_inputs(num_head_kv, num_seq_q)
++    q, kcache, vcache, block_ids, total_lens = _make_inputs(
++        GLOBAL_NUM_HEAD_Q, num_head_kv, num_seq_q, 2026
++    )
 +    task_map = hpc.get_attention_decode_task_workspace(
 +        q.size(0), int(total_lens.max().item()), num_head_kv, min_process_len=64
 +    )
@@ -783,8 +971,6 @@ index 0000000..07c650c
 +            new_kv_included=True,
 +            splitk=False,
 +        )
-
-base-commit: 1cd332980ed46bd0172091c1c35d55338fcae47a
 -- 
 2.43.0
 

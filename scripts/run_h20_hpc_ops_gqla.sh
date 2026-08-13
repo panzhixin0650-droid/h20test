@@ -15,6 +15,7 @@ batch=${GQLA_HPC_OPS_BATCH:-128}
 seqlen=${GQLA_HPC_OPS_SEQLEN:-8192}
 warmup=${GQLA_HPC_OPS_WARMUP:-5}
 iterations=${GQLA_HPC_OPS_ITERS:-20}
+profile_calls=${GQLA_HPC_OPS_PROFILE_CALLS:-10}
 flush_gib=${GQLA_HPC_OPS_FLUSH_GIB:-8}
 table2_hbm_tb_s=${GQLA_TABLE2_H20_HBM_TB_S:-4.0}
 table2_bf16_tflops=${GQLA_TABLE2_H20_BF16_TFLOPS:-148.0}
@@ -290,7 +291,7 @@ fi
 cp -- "${wheels[0]}" "$run_dir/"
 printf 'Wheel: %s/%s\n' "$run_dir" "$(basename -- "${wheels[0]}")"
 
-printf 'Running six reference-correctness cases...\n'
+printf 'Running 18 reference-correctness cases (16 TP shapes plus 2 split-K hints)...\n'
 "$hpc_python" -u "$script_dir/check_hpc_ops_gqla.py" \
     --source-dir "$source_dir" \
     --expect-device-substring "$expected_device"
@@ -307,16 +308,18 @@ printf 'Running B=%s L=%s HPC-Ops GQLA benchmark...\n' "$batch" "$seqlen"
     --seqlen "$seqlen" \
     --warmup "$warmup" \
     --iters "$iterations" \
+    --profile-calls "$profile_calls" \
     --flush-gib "$flush_gib" \
     --modes static \
     --json "$raw_json"
 
-"$hpc_python" -u "$script_dir/render_hpc_ops_gqla_table.py" \
+"$hpc_python" -u "$script_dir/render_hpc_ops_gqla_tp.py" \
     --input "$raw_json" \
     --output-json "$published_json" \
     --csv "$table_csv" \
     --markdown "$table_markdown" \
     --expect-device-substring "$expected_device" \
+    --device-role H20 \
     --expect-batch "$batch" \
     --expect-seqlen "$seqlen" \
     --source-url "$source_url" \
@@ -326,8 +329,8 @@ printf 'Running B=%s L=%s HPC-Ops GQLA benchmark...\n' "$batch" "$seqlen"
     --run-id "$run_id" \
     --table2-hbm-tb-s "$table2_hbm_tb_s" \
     --table2-bf16-tflops "$table2_bf16_tflops" \
-    --h20-measured-hbm-tb-s "$h20_measured_hbm_tb_s" \
-    --h20-measured-bf16-tflops "$h20_measured_bf16_tflops"
+    --measured-hbm-tb-s "$h20_measured_hbm_tb_s" \
+    --measured-bf16-tflops "$h20_measured_bf16_tflops"
 
 install -m 0644 "$published_json" "$output_root/hpc_ops_gqla_h20.json"
 install -m 0644 "$table_csv" "$output_root/hpc_ops_gqla_h20.csv"

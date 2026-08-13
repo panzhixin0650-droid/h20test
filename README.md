@@ -11,6 +11,34 @@
 
 完整协议与故障排查见 [H20_REPRODUCTION_ZH.md](docs/H20_REPRODUCTION_ZH.md)。
 
+## HPC-Ops GQLA TP=1/2/4/8 重测
+
+H20 上的 `QK=192/V=128` HPC-Ops 补丁与一键入口也保存在本仓库。它固定
+`B=128, L=8192, global H_Q=128, g in {8,4}, s_q in {1,2}`，在一张 H20
+上测试 TP=1/2/4/8 的 16 个 rank-local shape；不含 NCCL，吞吐不乘 TP。
+
+```bash
+git clone https://github.com/panzhixin0650-droid/h20test.git h20test-hpcops-tp
+cd h20test-hpcops-tp
+bash run_hpc_ops_gqla_tp.sh
+```
+
+入口会创建/复用隔离环境、克隆固定 HPC-Ops 基线、校验补丁、编译 wheel、执行
+18 个 reference correctness case，再进行冷缓存 full 与 main-kernel 测速。成功时
+打印 `HPC_OPS_GQLA_H20_OK`，结构化结果位于：
+
+```text
+/prodcpfs/user/panzhixin/GQLA/outputs/kernel_table2/hpc_ops_gqla_h20.json
+```
+
+`(g=4, s_q=2)` 的 M64 specialization 在报告中明确标为仍有优化空间；当前值原样
+保留。结果过大而无法直接上传时，可执行：
+
+```bash
+RESULT=/prodcpfs/user/panzhixin/GQLA/outputs/kernel_table2/hpc_ops_gqla_h20.json
+gzip -9 -c "$RESULT" | base64 -w 76
+```
+
 ## 固定版本
 
 - FlashMLA：`15f13e5030374295491c5ce31b02d7e63a7772c6`

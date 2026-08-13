@@ -13,11 +13,17 @@ import torch
 
 
 BLOCK_SIZE = 64
-NUM_HEAD_Q = 128
+GLOBAL_NUM_HEAD_Q = 128
 QK_DIM = 192
 V_DIM = 128
-STATIC_CASES = ((8, 1), (8, 2), (4, 1), (4, 2))
-SPLITK_HINT_CASES = ((8, 1), (4, 2))
+TP_SIZES = (1, 2, 4, 8)
+STATIC_CASES = tuple(
+    (global_num_head_kv, num_seq_q, tp_size)
+    for global_num_head_kv in (8, 4)
+    for num_seq_q in (1, 2)
+    for tp_size in TP_SIZES
+)
+SPLITK_HINT_CASES = ((8, 1, 1), (4, 2, 1))
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,8 +52,7 @@ def import_hpc(source_dir: Path):
     return hpc, candidates[0]
 
 
-def make_inputs(num_head_kv: int, num_seq_q: int):
-    seed = 2026 + num_head_kv * 10 + num_seq_q
+def make_inputs(num_head_q: int, num_head_kv: int, num_seq_q: int, seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -57,7 +62,7 @@ def make_inputs(num_head_kv: int, num_seq_q: int):
     total_blocks = int(num_blocks.sum().item())
 
     q = torch.randn(
-        (num_batch * num_seq_q, NUM_HEAD_Q, QK_DIM),
+        (num_batch * num_seq_q, num_head_q, QK_DIM),
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -88,12 +93,14 @@ def make_inputs(num_head_kv: int, num_seq_q: int):
     return q, kcache, vcache, block_ids, total_lens
 
 
-def reference(q, kcache, vcache, block_ids, total_lens, num_head_kv, num_seq_q):
+def reference(
+    q, kcache, vcache, block_ids, total_lens, num_head_q, num_head_kv, num_seq_q
+):
     num_batch = total_lens.numel()
-    heads_per_group = NUM_HEAD_Q // num_head_kv
-    q = q.reshape(num_batch, num_seq_q, NUM_HEAD_Q, QK_DIM)
+    heads_per_group = num_head_q // num_head_kv
+    q = q.reshape(num_batch, num_seq_q, num_head_q, QK_DIM)
     output = torch.empty(
-        (num_batch, num_seq_q, NUM_HEAD_Q, V_DIM),
+        (num_batch, num_seq_q, num_head_q, V_DIM),
         dtype=torch.float32,
         device="cuda",
     )
@@ -115,16 +122,36 @@ def reference(q, kcache, vcache, block_ids, total_lens, num_head_kv, num_seq_q):
         probabilities = torch.softmax(scores.masked_fill(~causal_mask, -torch.inf), dim=-1)
         output[batch_idx] = torch.matmul(probabilities, v).transpose(0, 1)
 
-    return output.reshape(num_batch * num_seq_q, NUM_HEAD_Q, V_DIM).to(torch.bfloat16)
+    return output.reshape(num_batch * num_seq_q, num_head_q, V_DIM).to(torch.bfloat16)
 
 
-def check_case(hpc, num_head_kv: int, num_seq_q: int, splitk: bool, atol: float, rtol: float):
-    q, kcache, vcache, block_ids, total_lens = make_inputs(num_head_kv, num_seq_q)
+def check_case(
+    hpc,
+    global_num_head_kv: int,
+    num_seq_q: int,
+    tp_size: int,
+    splitk: bool,
+    atol: float,
+    rtol: float,
+):
+    local_num_head_q = GLOBAL_NUM_HEAD_Q // tp_size
+    local_num_head_kv = max(global_num_head_kv // tp_size, 1)
+    seed = 2026 + global_num_head_kv * 100 + num_seq_q * 10 + tp_size
+    q, kcache, vcache, block_ids, total_lens = make_inputs(
+        local_num_head_q, local_num_head_kv, num_seq_q, seed
+    )
     expected = reference(
-        q, kcache, vcache, block_ids, total_lens, num_head_kv, num_seq_q
+        q,
+        kcache,
+        vcache,
+        block_ids,
+        total_lens,
+        local_num_head_q,
+        local_num_head_kv,
+        num_seq_q,
     )
     output = torch.empty(
-        (q.size(0), NUM_HEAD_Q, V_DIM), dtype=torch.bfloat16, device="cuda"
+        (q.size(0), local_num_head_q, V_DIM), dtype=torch.bfloat16, device="cuda"
     )
     actual = hpc.attention_decode_bf16(
         q,
@@ -146,7 +173,9 @@ def check_case(hpc, num_head_kv: int, num_seq_q: int, splitk: bool, atol: float,
     torch.testing.assert_close(actual.float(), expected.float(), atol=atol, rtol=rtol)
     max_abs_error = (actual.float() - expected.float()).abs().max().item()
     print(
-        f"CHECK_OK Hkv={num_head_kv} Sq={num_seq_q} splitk_hint={splitk} "
+        f"CHECK_OK g={global_num_head_kv} Sq={num_seq_q} TP={tp_size} "
+        f"local_Hq={local_num_head_q} local_Hkv={local_num_head_kv} "
+        f"splitk_hint={splitk} "
         f"max_abs_error={max_abs_error:.6f}",
         flush=True,
     )
@@ -175,12 +204,28 @@ def main() -> None:
         flush=True,
     )
 
-    for num_head_kv, num_seq_q in STATIC_CASES:
-        check_case(hpc, num_head_kv, num_seq_q, False, args.atol, args.rtol)
-    for num_head_kv, num_seq_q in SPLITK_HINT_CASES:
-        check_case(hpc, num_head_kv, num_seq_q, True, args.atol, args.rtol)
+    for global_num_head_kv, num_seq_q, tp_size in STATIC_CASES:
+        check_case(
+            hpc,
+            global_num_head_kv,
+            num_seq_q,
+            tp_size,
+            False,
+            args.atol,
+            args.rtol,
+        )
+    for global_num_head_kv, num_seq_q, tp_size in SPLITK_HINT_CASES:
+        check_case(
+            hpc,
+            global_num_head_kv,
+            num_seq_q,
+            tp_size,
+            True,
+            args.atol,
+            args.rtol,
+        )
 
-    print("HPC_OPS_GQLA_CORRECTNESS_OK cases=6", flush=True)
+    print("HPC_OPS_GQLA_CORRECTNESS_OK cases=18", flush=True)
 
 
 if __name__ == "__main__":
