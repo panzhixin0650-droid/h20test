@@ -6,6 +6,7 @@ script_path=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename --
 script_dir=$(dirname -- "$script_path")
 conda_env_name=${GQLA_TABLE2_CONDA_ENV:-h20table2}
 tuna_index=${GQLA_TABLE2_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
+fallback_index=${GQLA_TABLE2_PYPI_FALLBACK_INDEX:-https://pypi.org/simple}
 torch_index=${GQLA_TABLE2_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
 torch_wheel=${GQLA_TABLE2_TORCH_WHEEL:-}
 pip_timeout=${GQLA_TABLE2_PIP_TIMEOUT:-300}
@@ -90,12 +91,34 @@ mirror_args=(
     --retries "$pip_retries"
     --prefer-binary
 )
+fallback_args=(
+    --index-url "$fallback_index"
+    --timeout "$pip_timeout"
+    --retries "$pip_retries"
+    --prefer-binary
+)
+
+pip_install_with_fallback() {
+    local rc
+    if "$python_bin" -m pip install "${mirror_args[@]}" "$@"; then
+        return 0
+    else
+        rc=$?
+    fi
+    if [[ -z "$fallback_index" || "$fallback_index" == "$tuna_index" ]]; then
+        return "$rc"
+    fi
+    printf 'Primary PyPI mirror failed (rc=%s); retrying with %s\n' \
+        "$rc" "$fallback_index" >&2
+    "$python_bin" -m pip install "${fallback_args[@]}" "$@"
+}
 
 printf 'Python: %s\n' "$python_bin"
 printf 'CUDA Toolkit: %s\n' "$cuda_release"
 printf 'PyPI mirror: %s\n' "$tuna_index"
+printf 'PyPI fallback: %s\n' "$fallback_index"
 
-"$python_bin" -m pip install "${mirror_args[@]}" --upgrade \
+pip_install_with_fallback --upgrade \
     pip \
     wheel \
     'setuptools<82' \
@@ -111,19 +134,20 @@ printf 'PyPI mirror: %s\n' "$tuna_index"
     jinja2 \
     'fsspec>=0.8.5'
 
-"$python_bin" -m pip install "${mirror_args[@]}" \
+pip_install_with_fallback \
     'cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1' \
     cuda-bindings==12.9.4
 
-"$python_bin" -m pip install "${mirror_args[@]}" \
+pip_install_with_fallback \
     nvidia-cudnn-cu12==9.19.0.56 \
     nvidia-cusparselt-cu12==0.7.1 \
     nvidia-nccl-cu12==2.28.9 \
     nvidia-nvshmem-cu12==3.4.5 \
     triton==3.6.0
 
-# Resolve CUDA dependencies exclusively from TUNA above. Installing torch with
-# --no-deps prevents the PyTorch index from redirecting cuda-toolkit downloads
+# Resolve CUDA dependencies before Torch from the selected PyPI mirror (with
+# the official PyPI fallback above). Installing Torch with --no-deps prevents
+# the PyTorch index from redirecting cuda-toolkit downloads
 # to a cluster-inaccessible NVIDIA package host.  The one-click H20 launcher
 # can provide a persistent, resumably downloaded wheel so evicted nodes do not
 # have to fetch the 820 MB artifact again.

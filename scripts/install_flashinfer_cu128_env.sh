@@ -9,6 +9,7 @@ set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 conda_env_name=${FLASHINFER_GQA_CONDA_ENV:-flashinfer-gqa-cu128}
 pypi_index=${FLASHINFER_GQA_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
+fallback_index=${FLASHINFER_GQA_PYPI_FALLBACK_INDEX:-${GQLA_TABLE2_PYPI_FALLBACK_INDEX:-https://pypi.org/simple}}
 flashinfer_version=${FLASHINFER_GQA_VERSION:-0.6.11.post2}
 pip_timeout=${FLASHINFER_GQA_PIP_TIMEOUT:-300}
 pip_retries=${FLASHINFER_GQA_PIP_RETRIES:-20}
@@ -22,6 +23,7 @@ fi
 # untouched by giving this workload its own conda prefix.
 GQLA_TABLE2_CONDA_ENV="$conda_env_name" \
 GQLA_TABLE2_PYPI_INDEX="$pypi_index" \
+GQLA_TABLE2_PYPI_FALLBACK_INDEX="$fallback_index" \
     bash "$script_dir/install_cu128_env.sh"
 
 conda_env_prefix=$(conda env list | \
@@ -41,10 +43,31 @@ mirror_args=(
     --retries "$pip_retries"
     --prefer-binary
 )
+fallback_args=(
+    --index-url "$fallback_index"
+    --timeout "$pip_timeout"
+    --retries "$pip_retries"
+    --prefer-binary
+)
+
+pip_install_with_fallback() {
+    local rc
+    if "$python_bin" -m pip install "${mirror_args[@]}" "$@"; then
+        return 0
+    else
+        rc=$?
+    fi
+    if [[ -z "$fallback_index" || "$fallback_index" == "$pypi_index" ]]; then
+        return "$rc"
+    fi
+    printf 'Primary PyPI mirror failed (rc=%s); retrying with %s\n' \
+        "$rc" "$fallback_index" >&2
+    "$python_bin" -m pip install "${fallback_args[@]}" "$@"
+}
 
 # Install every non-Torch direct dependency first.  None of these requirements
 # asks pip to resolve Torch.  The core package is installed separately below.
-"$python_bin" -m pip install "${mirror_args[@]}" \
+pip_install_with_fallback \
     apache-tvm-ffi==0.1.9 \
     click==8.4.1 \
     cuda-tile==1.4.0 \
@@ -61,7 +84,7 @@ mirror_args=(
     cuda-python==12.9.4 \
     cuda-bindings==12.9.4
 
-"$python_bin" -m pip install "${mirror_args[@]}" \
+pip_install_with_fallback \
     --no-deps \
     "flashinfer-python==$flashinfer_version"
 

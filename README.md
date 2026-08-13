@@ -189,6 +189,7 @@ bash run_flashinfer_gqa_h20_oneclick.sh
 设备被驱逐或下载中断后，在能重新访问同一持久挂载的实例上重复这条命令即可；
 完整 wheel 会直接复用。指定其他空闲 GPU 使用 `--gpu N`，仅做流程 smoke test
 使用 `--quick`。成功时打印 `FLASHINFER_H20_ONECLICK_OK`。
+普通依赖优先使用清华 PyPI 镜像；若镜像临时缺包或不可用，会自动切换到官方 PyPI。
 
 ### 从仓库一键测速
 
