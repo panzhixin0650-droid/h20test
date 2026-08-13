@@ -178,6 +178,18 @@ Table 2 相同的 `B=128, L=8192, H_Q=128, D_QK=192, D_V=128`，覆盖
 `BatchPrefillWithPagedKVCacheWrapper(backend="fa2")`：这个接口支持不相等的
 QK/V head dimension，且 FA2 在这些 shape 上选择 M16/M64，而不是固定 M128。
 
+全新 H20 实例优先使用根目录的持久化一键入口。它自动识别当前
+`/mnt/.../task/<task>/record/<record>/data` 挂载，持久化 820 MB Torch wheel、
+conda 环境、包缓存、日志和结果，并用 aria2 断点续传。默认自动启动并进入 tmux：
+
+```bash
+bash run_flashinfer_gqa_h20_oneclick.sh
+```
+
+设备被驱逐或下载中断后，在能重新访问同一持久挂载的实例上重复这条命令即可；
+完整 wheel 会直接复用。指定其他空闲 GPU 使用 `--gpu N`，仅做流程 smoke test
+使用 `--quick`。成功时打印 `FLASHINFER_H20_ONECLICK_OK`。
+
 ### 从仓库一键测速
 
 仓库根目录的 [`run_flashinfer_gqa.sh`](run_flashinfer_gqa.sh) 是 H100/H20 共用

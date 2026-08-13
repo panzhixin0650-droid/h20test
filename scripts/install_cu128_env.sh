@@ -7,6 +7,7 @@ script_dir=$(dirname -- "$script_path")
 conda_env_name=${GQLA_TABLE2_CONDA_ENV:-h20table2}
 tuna_index=${GQLA_TABLE2_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
 torch_index=${GQLA_TABLE2_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
+torch_wheel=${GQLA_TABLE2_TORCH_WHEEL:-}
 pip_timeout=${GQLA_TABLE2_PIP_TIMEOUT:-300}
 pip_retries=${GQLA_TABLE2_PIP_RETRIES:-20}
 cuda_home=${CUDA_HOME:-/usr/local/cuda}
@@ -123,15 +124,31 @@ printf 'PyPI mirror: %s\n' "$tuna_index"
 
 # Resolve CUDA dependencies exclusively from TUNA above. Installing torch with
 # --no-deps prevents the PyTorch index from redirecting cuda-toolkit downloads
-# to a cluster-inaccessible NVIDIA package host.
-"$python_bin" -m pip install \
-    --index-url "$torch_index" \
-    --timeout "$pip_timeout" \
-    --retries "$pip_retries" \
-    --prefer-binary \
-    --no-deps \
-    --upgrade \
-    'torch==2.11.0+cu128'
+# to a cluster-inaccessible NVIDIA package host.  The one-click H20 launcher
+# can provide a persistent, resumably downloaded wheel so evicted nodes do not
+# have to fetch the 820 MB artifact again.
+if [[ -n "$torch_wheel" ]]; then
+    if [[ ! -f "$torch_wheel" ]]; then
+        printf 'Configured local Torch wheel is absent: %s\n' \
+            "$torch_wheel" >&2
+        exit 2
+    fi
+    printf 'Installing Torch from persistent local wheel: %s\n' \
+        "$torch_wheel"
+    "$python_bin" -m pip install \
+        --no-deps \
+        --upgrade \
+        "$torch_wheel"
+else
+    "$python_bin" -m pip install \
+        --index-url "$torch_index" \
+        --timeout "$pip_timeout" \
+        --retries "$pip_retries" \
+        --prefer-binary \
+        --no-deps \
+        --upgrade \
+        'torch==2.11.0+cu128'
+fi
 
 "$python_bin" -m pip check
 "$python_bin" -c \
