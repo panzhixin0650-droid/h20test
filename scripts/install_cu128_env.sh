@@ -182,6 +182,17 @@ fi
 
 uv_bin=$(dirname -- "$python_bin")/uv
 test -x "$uv_bin"
+ninja_bin=$("$python_bin" - <<'PY'
+import os
+import ninja
+
+path = os.path.join(ninja.BIN_DIR, "ninja")
+assert os.path.isfile(path) and os.access(path, os.X_OK), path
+print(path)
+PY
+)
+test -x "$ninja_bin"
+printf 'NINJA_OK path=%s version=%s\n' "$ninja_bin" "$("$ninja_bin" --version)"
 printf 'H20_CU128_ENV_OK\n'
 printf 'Activate it in the current shell with:\n'
 printf '  conda activate %s\n' "$conda_env_name"

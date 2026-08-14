@@ -327,6 +327,38 @@ if [[ -z "$python_bin" ]] || ! complete_environment_ready "$python_bin"; then
     exit 2
 fi
 
+# Selecting an environment by its absolute Python path does not activate that
+# environment.  FlashInfer's first-use JIT launches `ninja` by name, so expose
+# the binary shipped by the selected, pinned ninja Python wheel on PATH.
+python_bin_dir=$(dirname -- "$python_bin")
+ninja_bin=$("$python_bin" - <<'PY' 2>/dev/null || true
+import os
+import sys
+
+try:
+    import ninja
+except ImportError:
+    raise SystemExit(1)
+
+for candidate in (
+    os.path.join(ninja.BIN_DIR, "ninja"),
+    os.path.join(os.path.dirname(sys.executable), "ninja"),
+):
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        print(candidate)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)
+if [[ -z "$ninja_bin" || ! -x "$ninja_bin" ]]; then
+    printf 'The selected environment has no executable ninja binary: %s\n' \
+        "$python_bin" >&2
+    printf '%s\n' \
+        'Re-run with --bootstrap-cu128 to repair the pinned environment.' >&2
+    exit 2
+fi
+export PATH="$(dirname -- "$ninja_bin"):$python_bin_dir:$PATH"
+
 device_record=$(CUDA_VISIBLE_DEVICES="$gpu_index" "$python_bin" - <<'PY'
 import torch
 
@@ -455,6 +487,8 @@ nvidia-smi topo -m >"$topology_txt"
     printf 'profile=%s\n' "$profile"
     printf 'mode=%s\n' "$mode"
     printf 'python=%s\n' "$python_bin"
+    printf 'ninja=%s\n' "$ninja_bin"
+    printf 'ninja_version=%s\n' "$("$ninja_bin" --version)"
     printf 'device=%s\n' "$device_name"
     printf 'compute_capability=%s.%s\n' "$capability_major" "$capability_minor"
     printf 'torch=%s\n' "$detected_torch"
