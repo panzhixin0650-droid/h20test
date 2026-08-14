@@ -118,32 +118,43 @@ printf 'CUDA Toolkit: %s\n' "$cuda_release"
 printf 'PyPI mirror: %s\n' "$tuna_index"
 printf 'PyPI fallback: %s\n' "$fallback_index"
 
-pip_install_with_fallback --upgrade \
-    pip \
-    wheel \
-    'setuptools<82' \
-    packaging \
-    ninja \
-    psutil \
-    uv \
-    numpy \
-    filelock \
-    'typing-extensions>=4.10.0' \
-    'sympy>=1.13.3' \
-    'networkx>=2.5.1' \
-    jinja2 \
+base_requirements=(
+    pip
+    wheel
+    'setuptools<82'
+    packaging==26.2
+    ninja==1.13.0
+    psutil
+    uv
+    numpy==2.3.5
+    filelock
+    'typing-extensions>=4.10.0'
+    'sympy>=1.13.3'
+    'networkx>=2.5.1'
+    jinja2
     'fsspec>=0.8.5'
-
-pip_install_with_fallback \
-    'cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1' \
+)
+cuda_requirements=(
+    'cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1'
     cuda-bindings==12.9.4
-
-pip_install_with_fallback \
-    nvidia-cudnn-cu12==9.19.0.56 \
-    nvidia-cusparselt-cu12==0.7.1 \
-    nvidia-nccl-cu12==2.28.9 \
-    nvidia-nvshmem-cu12==3.4.5 \
+    nvidia-cudnn-cu12==9.19.0.56
+    nvidia-cusparselt-cu12==0.7.1
+    nvidia-nccl-cu12==2.28.9
+    nvidia-nvshmem-cu12==3.4.5
     triton==3.6.0
+)
+
+# Retry only the requirement that is absent from the primary mirror. Retrying
+# a whole group would unnecessarily move large, otherwise available wheels to
+# the slower fallback index.
+for requirement in "${base_requirements[@]}"; do
+    printf 'Installing base requirement: %s\n' "$requirement"
+    pip_install_with_fallback --upgrade "$requirement"
+done
+for requirement in "${cuda_requirements[@]}"; do
+    printf 'Installing CUDA requirement: %s\n' "$requirement"
+    pip_install_with_fallback "$requirement"
+done
 
 # Resolve CUDA dependencies before Torch from the selected PyPI mirror (with
 # the official PyPI fallback above). Installing Torch with --no-deps prevents

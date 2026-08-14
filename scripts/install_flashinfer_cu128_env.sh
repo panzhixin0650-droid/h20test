@@ -65,24 +65,31 @@ pip_install_with_fallback() {
     "$python_bin" -m pip install "${fallback_args[@]}" "$@"
 }
 
-# Install every non-Torch direct dependency first.  None of these requirements
-# asks pip to resolve Torch.  The core package is installed separately below.
-pip_install_with_fallback \
-    apache-tvm-ffi==0.1.9 \
-    click==8.4.1 \
-    cuda-tile==1.4.0 \
-    einops==0.8.2 \
-    ninja==1.13.0 \
-    numpy==2.3.5 \
-    nvidia-cudnn-frontend==1.18.0 \
-    nvidia-cutlass-dsl==4.5.2 \
-    nvidia-ml-py==13.610.43 \
-    packaging==26.2 \
-    requests==2.34.2 \
-    tabulate==0.10.0 \
-    tqdm==4.68.3 \
-    cuda-python==12.9.4 \
+runtime_requirements=(
+    apache-tvm-ffi==0.1.9
+    click==8.4.1
+    cuda-tile==1.4.0
+    einops==0.8.2
+    ninja==1.13.0
+    numpy==2.3.5
+    nvidia-cudnn-frontend==1.18.0
+    nvidia-cutlass-dsl==4.5.2
+    nvidia-ml-py==13.610.43
+    packaging==26.2
+    requests==2.34.2
+    tabulate==0.10.0
+    tqdm==4.68.3
+    cuda-python==12.9.4
     cuda-bindings==12.9.4
+)
+
+# Install direct requirements separately so a single mirror miss does not move
+# the entire dependency group to the slower fallback index. None asks pip to
+# resolve Torch; the FlashInfer core wheel remains a separate --no-deps step.
+for requirement in "${runtime_requirements[@]}"; do
+    printf 'Installing FlashInfer requirement: %s\n' "$requirement"
+    pip_install_with_fallback "$requirement"
+done
 
 pip_install_with_fallback \
     --no-deps \
