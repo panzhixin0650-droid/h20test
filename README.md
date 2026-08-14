@@ -259,3 +259,12 @@ MiB。默认还会用 request 0 的 float32 PyTorch attention 做正确性检查
 `--no-kernel-profile` 跳过额外的 Kineto 记录；正式性能口径始终是
 `triton.testing.do_bench` 的冷 L2 完整调用 p50。一键入口始终显式选择 FA2，
 不能改成 `auto`，否则 Hopper 上可能重新选择 FA3。
+
+### H20 正式实测结论
+
+2026-08-14 的 H20 正式 run 已验证通过。FlashInfer FA2 对
+`H_KV=8,S_Q=1` 选择 M16，把 FA3 的 `40.677 µs/序列` 降到
+`13.323 µs/序列`（`3.05×`）；其余三个 shape 选择 M64，约为
+`1.24×` 加速，尚未完全消除 H20 的计算瓶颈。完整比较、Roofline 分解、
+正确性结果和可校验原始 bundle 见
+[`docs/FLASHINFER_GQA_H20_RESULTS.md`](docs/FLASHINFER_GQA_H20_RESULTS.md)。
