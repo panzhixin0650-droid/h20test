@@ -12,6 +12,39 @@
 
 ## 启动
 
+### 全新节点一键准备环境并启动（推荐）
+
+如果节点没有 PyTorch，使用仓库内复用 FlashInfer one-click 下载策略的新入口：
+
+```bash
+./bootstrap_and_start_gpu_stress_7d.sh all
+```
+
+它会依次执行：
+
+1. 复用任意已有且能访问 CUDA GPU 的 PyTorch 环境；
+2. 若没有，则自动检测任务持久挂载并创建最小 Python 3.12 环境；
+3. 使用 `aria2c` 16 路断点续传 Torch wheel，同时创建 Conda 环境；
+4. 使用 `uv` 并发下载并安装 Torch 的运行时依赖；
+5. 校验 CUDA 和 GPU 后，在同一个 `gpu-stress-7d` tmux 中启动七天压测。
+
+指定多卡或缓存位置：
+
+```bash
+./bootstrap_and_start_gpu_stress_7d.sh 0,1,2,3
+./bootstrap_and_start_gpu_stress_7d.sh all --cache-root /persistent/path/gpu-stress
+```
+
+下载、Conda 包、uv/pip 缓存和环境会持久化，并与仓库的 FlashInfer H20 one-click
+共享 `.../panzhixin/GQLA` 缓存根；中断后重新运行同一条命令即可续传和复用，不会
+重新下载完整 wheel。查看安装或压测过程：
+
+```bash
+tmux attach -t gpu-stress-7d
+```
+
+### 已有 CUDA PyTorch 环境
+
 单卡 GPU 0：
 
 ```bash
