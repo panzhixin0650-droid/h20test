@@ -67,6 +67,10 @@ PYTHON_BIN=/path/to/python \
 - `PYTHON_BIN`：使用的 Python 解释器，默认 `python3`。
 - `SESSION_NAME`：tmux 会话名，默认 `gpu-stress-7d`。
 
+若默认 `python3` 没有 CUDA PyTorch，启动器会扫描 `conda env list`，自动选择第一套
+能够访问 GPU 的 PyTorch 环境。显式设置了 `PYTHON_BIN` 时不会自动切换环境，而是
+在该解释器不可用时直接报错。
+
 日志保存在 `logs/<UTC 启动时间>/`。建议先观察 10–30 分钟温度、功耗与错误日志，
 确认散热稳定后再进行长时间测试。
 
