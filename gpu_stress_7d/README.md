@@ -69,3 +69,7 @@ PYTHON_BIN=/path/to/python \
 
 日志保存在 `logs/<UTC 启动时间>/`。建议先观察 10–30 分钟温度、功耗与错误日志，
 确认散热稳定后再进行长时间测试。
+
+启动器还会写入 `logs/launcher_<UTC 启动时间>.log`。如果 tmux 会话在启动阶段
+退出，启动器会自动打印该日志中的错误。启动器会把当前 `python3` 解析成绝对路径，
+避免已有 tmux server 使用另一套 Conda/Python 环境。
