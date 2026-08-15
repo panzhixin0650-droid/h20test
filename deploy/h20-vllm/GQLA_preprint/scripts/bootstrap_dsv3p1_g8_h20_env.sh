@@ -246,6 +246,8 @@ if [[ -n "${UV_BIN:-}" ]]; then
     [[ -x "$UV_BIN" ]] || die "UV_BIN is not executable: $UV_BIN"
 elif [[ -x "$ENV_ROOT/tools/uv" ]]; then
     UV_BIN=$ENV_ROOT/tools/uv
+elif [[ -x "$REPO_DIR/tools/uv" ]]; then
+    UV_BIN=$REPO_DIR/tools/uv
 elif command -v uv >/dev/null 2>&1; then
     UV_BIN=$(command -v uv)
 else

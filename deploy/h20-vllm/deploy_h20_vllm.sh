@@ -10,6 +10,9 @@ BUNDLE_DIR="$SCRIPT_DIR/GQLA_preprint"
 PATCH_FILE="$REPO_ROOT/patches/0001-Add-runtime-attention-scale-for-GQLA-serving.patch"
 HPC_BUNDLE_ARCHIVE="$SCRIPT_DIR/hpc-ops-f85ce84.tar.gz"
 HPC_BUNDLE_SHA256=dd5a668ee454683a81d8857988e4285e9c1558d39cec92664c981e7b8c562e7e
+UV_BUNDLE_ARCHIVE="$SCRIPT_DIR/uv-0.9.3-x86_64-unknown-linux-gnu.xz"
+UV_BUNDLE_SHA256=dd572805f351a07266ba464a15fe134dbb32e082f048bae13e4f8f991e2b7b69
+UV_BINARY_SHA256=d7198eb91c8b6a7ead6eb5b2e7aca159124695c8783ff2df708f6864bc574bbf
 
 GQLA_ROOT=${GQLA_ROOT:-/mnt/tidalfs-alwl01/task/236362/GQLA}
 CODE_ROOT=${CODE_ROOT:-$GQLA_ROOT/code}
@@ -39,6 +42,25 @@ mkdir -p "$CODE_ROOT" "$GQLA_DST"
 cp -a "$BUNDLE_DIR/." "$GQLA_DST/"
 chmod +x "$GQLA_DST"/scripts/*.sh
 echo "[deploy] GQLA source -> $GQLA_DST"
+
+if [[ "$(uname -m)" == x86_64 ]] && [[ -f "$UV_BUNDLE_ARCHIVE" ]]; then
+  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+  command -v xz >/dev/null 2>&1 || die "xz is required to unpack bundled uv"
+  uv_archive_actual_sha256=$(sha256sum "$UV_BUNDLE_ARCHIVE" | awk '{print $1}')
+  [[ "$uv_archive_actual_sha256" == "$UV_BUNDLE_SHA256" ]] || \
+    die "bundled uv archive SHA256 mismatch"
+  uv_bundle_tmp=$(mktemp "$CODE_ROOT/.uv-bundle.XXXXXX")
+  xz -dc "$UV_BUNDLE_ARCHIVE" >"$uv_bundle_tmp"
+  uv_binary_actual_sha256=$(sha256sum "$uv_bundle_tmp" | awk '{print $1}')
+  [[ "$uv_binary_actual_sha256" == "$UV_BINARY_SHA256" ]] || \
+    die "bundled uv binary SHA256 mismatch"
+  mkdir -p "$GQLA_DST/tools"
+  install -m 0755 "$uv_bundle_tmp" "$GQLA_DST/tools/uv"
+  rm -f -- "$uv_bundle_tmp"
+  [[ "$("$GQLA_DST/tools/uv" --version)" == "uv 0.9.3" ]] || \
+    die "bundled uv failed its version check"
+  echo "[deploy] installed verified bundled uv 0.9.3 -> $GQLA_DST/tools/uv"
+fi
 
 if [[ ! -d "$HPC_DST/.git" ]]; then
   [[ ! -e "$HPC_DST" || -z "$(find "$HPC_DST" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] || \

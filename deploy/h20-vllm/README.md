@@ -54,6 +54,10 @@ bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
 The H20 deployment no longer needs a second GitHub request for HPC-Ops: its
 verified source archive is already inside this transit bundle.
 
+It also contains a SHA256-verified `uv 0.9.3` x86-64 executable. The deployer
+installs it under `GQLA_preprint/tools/uv`, so bootstrap does not depend on the
+often-blocked GitHub Releases object store before Python is available.
+
 Deploy and immediately create/check the environment in one command:
 
 ```bash
