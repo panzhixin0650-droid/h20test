@@ -1,0 +1,11 @@
+# Known-good serving stack for the DeepSeek-V3.1 G=8 vLLM/HPC benchmark.
+# This intentionally excludes lm-eval/datasets because the online benchmark
+# does not use them. HPC-Ops and the local GQLA plugin are installed separately
+# from source by scripts/bootstrap_dsv3p1_g8_h20_env.sh.
+torch==2.11.0
+vllm==0.22.1
+transformers==5.12.1
+setuptools==80.10.2
+wheel>=0.45.1
+cmake>=3.26,<4
+ninja>=1.12
