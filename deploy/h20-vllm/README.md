@@ -27,6 +27,26 @@ git clone --branch deploy/h20-vllm-20260815 --single-branch \
 bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
 ```
 
+If the machine's Git/GnuTLS client cannot complete a GitHub TLS handshake,
+download the same branch through GitHub codeload instead:
+
+```bash
+mkdir -p /mnt/tidalfs-alwl01/task/236362/GQLA/code/h20test
+cd /mnt/tidalfs-alwl01/task/236362/GQLA/code
+
+curl -fL --retry 10 --retry-delay 2 --connect-timeout 30 \
+  -o /tmp/h20test-h20-vllm.tar.gz \
+  'https://codeload.github.com/panzhixin0650-droid/h20test/tar.gz/refs/heads/deploy/h20-vllm-20260815'
+
+tar -xzf /tmp/h20test-h20-vllm.tar.gz \
+  --strip-components=1 -C h20test
+
+bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
+```
+
+The deployer also has this Git-to-codeload fallback for its pinned HPC-Ops
+download, so the same Git/GnuTLS failure will not block the second repository.
+
 Deploy and immediately create/check the environment in one command:
 
 ```bash

@@ -16,6 +16,7 @@ GQLA_DST=${GQLA_DST:-$CODE_ROOT/GQLA_preprint}
 HPC_DST=${HPC_DST:-$CODE_ROOT/hpc-ops}
 HPC_REMOTE=${HPC_REMOTE:-https://github.com/Tencent/hpc-ops.git}
 HPC_BASE_COMMIT=83165c3f7d1f2a4aa0bd1f8c0f37fab771b5190b
+HPC_ARCHIVE_URL=${HPC_ARCHIVE_URL:-https://codeload.github.com/Tencent/hpc-ops/tar.gz/$HPC_BASE_COMMIT}
 RUN_INSTALL=${RUN_INSTALL:-0}
 
 die() {
@@ -39,20 +40,54 @@ echo "[deploy] GQLA source -> $GQLA_DST"
 if [[ ! -d "$HPC_DST/.git" ]]; then
   [[ ! -e "$HPC_DST" || -z "$(find "$HPC_DST" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] || \
     die "$HPC_DST exists and is not an empty Git repository"
-  mkdir -p "$HPC_DST"
-  git -C "$HPC_DST" init -q
-  git -C "$HPC_DST" remote add origin "$HPC_REMOTE"
-  git -C "$HPC_DST" fetch --depth=1 origin "$HPC_BASE_COMMIT"
-  git -C "$HPC_DST" checkout -q --detach FETCH_HEAD
+  [[ ! -d "$HPC_DST" ]] || rmdir "$HPC_DST"
+
+  hpc_fetch_tmp=$(mktemp -d "$CODE_ROOT/.hpc-ops-fetch.XXXXXX")
+  hpc_fetch_src="$hpc_fetch_tmp/source"
+  hpc_fetch_archive="$hpc_fetch_tmp/hpc-ops.tar.gz"
+
+  if (
+    set -Eeuo pipefail
+    mkdir -p "$hpc_fetch_src"
+    git -C "$hpc_fetch_src" init -q
+    git -C "$hpc_fetch_src" remote add origin "$HPC_REMOTE"
+    git -C "$hpc_fetch_src" fetch --depth=1 origin "$HPC_BASE_COMMIT" || exit 1
+    git -C "$hpc_fetch_src" checkout -q --detach FETCH_HEAD
+  ); then
+    echo "[deploy] fetched HPC-Ops with Git"
+  else
+    echo "[deploy] Git fetch failed; retrying HPC-Ops through codeload archive" >&2
+    command -v curl >/dev/null 2>&1 || die "curl is required for the archive fallback"
+    command -v tar >/dev/null 2>&1 || die "tar is required for the archive fallback"
+    rm -rf -- "$hpc_fetch_src"
+    mkdir -p "$hpc_fetch_src"
+    curl -fL \
+      --retry 10 --retry-delay 2 --connect-timeout 30 --max-time 1800 \
+      -o "$hpc_fetch_archive" "$HPC_ARCHIVE_URL"
+    tar -xzf "$hpc_fetch_archive" --strip-components=1 -C "$hpc_fetch_src"
+    git -C "$hpc_fetch_src" init -q
+    printf '%s\n' "$HPC_BASE_COMMIT" >"$hpc_fetch_src/.gqla_hpc_base_commit"
+    echo "[deploy] fetched pinned HPC-Ops codeload archive"
+  fi
+
+  mv "$hpc_fetch_src" "$HPC_DST"
+  rm -rf -- "$hpc_fetch_tmp"
   echo "[deploy] HPC-Ops baseline -> $HPC_DST"
 fi
 
 if git -C "$HPC_DST" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
   echo "[deploy] HPC-Ops GQLA runtime-scale patch is already applied"
 else
-  current_commit=$(git -C "$HPC_DST" rev-parse HEAD)
-  [[ "$current_commit" == "$HPC_BASE_COMMIT" ]] || \
-    die "HPC-Ops HEAD is $current_commit; expected $HPC_BASE_COMMIT"
+  hpc_base_ok=0
+  current_commit=$(git -C "$HPC_DST" rev-parse --verify HEAD 2>/dev/null || true)
+  if [[ "$current_commit" == "$HPC_BASE_COMMIT" ]]; then
+    hpc_base_ok=1
+  elif [[ -f "$HPC_DST/.gqla_hpc_base_commit" ]] && \
+       [[ "$(<"$HPC_DST/.gqla_hpc_base_commit")" == "$HPC_BASE_COMMIT" ]]; then
+    hpc_base_ok=1
+  fi
+  [[ "$hpc_base_ok" == "1" ]] || \
+    die "HPC-Ops is not the expected pinned source $HPC_BASE_COMMIT"
   [[ -z "$(git -C "$HPC_DST" status --porcelain --untracked-files=no)" ]] || \
     die "HPC-Ops has tracked local changes; refusing to overwrite them"
   git -C "$HPC_DST" apply --check "$PATCH_FILE"
