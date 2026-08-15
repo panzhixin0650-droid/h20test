@@ -6,6 +6,17 @@
 scripts/benchmark_dsv3p1_g8_h20_tp8.sh
 ```
 
+单机一次串行跑完 `2K / 8K / 16K × MLA / GQLA` 六个 fresh-server case：
+
+```text
+scripts/benchmark_dsv3p1_g8_h20_tp8_all.sh
+```
+
+总入口默认使用 1024 个正式请求、64 个 warmup、最大并发 64 和固定 128-token
+输出。每个长度/路径都重新启动服务，因此会加载六次完整 checkpoint，但不同 case 之间
+不会共享 KV cache、CUDA graph 或 scheduler 状态。可用 `PROFILES=2k,8k` 或
+`PATHS=gqa-hpc` 只跑子集；加入 `16k-b20` 可额外测相同并发的 16K 配对。
+
 固定 16K/128 且每次只跑一条路径的入口是：
 
 ```text

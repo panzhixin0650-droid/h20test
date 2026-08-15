@@ -67,6 +67,24 @@ reuses the environment, wheel cache, source tree, and compiled HPC wheel.
 
 ## Benchmark after install
 
+The paths above are defaults only. For a checkpoint rooted at
+`/mnt/public03/task/236362/GQLA`, pass `GQLA_ROOT` (and optionally
+`MODEL_DIR`) to both deploy and benchmark commands.
+
+Run the full single-node matrix—fresh servers for `2K / 8K / 16K` and both
+MLA/GQLA routes—in one command:
+
+```bash
+cd /mnt/public03/task/236362/GQLA/code/GQLA_preprint
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  GQLA_ROOT=/mnt/public03/task/236362/GQLA \
+  MATRIX_RUN_ID_BASE=h20-tp8-all-001 \
+  bash scripts/benchmark_dsv3p1_g8_h20_tp8_all.sh
+```
+
+Use `PROFILES=2k,8k`, `PATHS=gqa-hpc`, or
+`PROFILES=2k,8k,16k,16k-b20` to select a smaller or extended matrix.
+
 Both 2K paths, sequentially:
 
 ```bash
