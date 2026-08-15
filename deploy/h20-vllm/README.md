@@ -58,6 +58,10 @@ It also contains a SHA256-verified `uv 0.9.3` x86-64 executable. The deployer
 installs it under `GQLA_preprint/tools/uv`, so bootstrap does not depend on the
 often-blocked GitHub Releases object store before Python is available.
 
+A portable, SHA256-verified CPython 3.12.12 runtime is bundled as well and is
+installed under `GQLA/envs/python`. Therefore repairing a copied venv also
+requires no GitHub Releases download.
+
 Deploy and immediately create/check the environment in one command:
 
 ```bash

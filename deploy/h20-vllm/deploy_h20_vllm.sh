@@ -13,9 +13,13 @@ HPC_BUNDLE_SHA256=dd5a668ee454683a81d8857988e4285e9c1558d39cec92664c981e7b8c562e
 UV_BUNDLE_ARCHIVE="$SCRIPT_DIR/uv-0.9.3-x86_64-unknown-linux-gnu.xz"
 UV_BUNDLE_SHA256=dd572805f351a07266ba464a15fe134dbb32e082f048bae13e4f8f991e2b7b69
 UV_BINARY_SHA256=d7198eb91c8b6a7ead6eb5b2e7aca159124695c8783ff2df708f6864bc574bbf
+PYTHON_BUNDLE_ARCHIVE="$SCRIPT_DIR/cpython-3.12.12-linux-x86_64-gnu.tar.xz"
+PYTHON_BUNDLE_SHA256=33febdd58c2aa359635c4e0381f5c00c7a4a25860e57469e36a744c0eeabe70d
+PYTHON_BINARY_SHA256=4304de9fdcd8465bbf4bf0814bb7abadd6d33971bab26ae38d1080c355fec983
 
 GQLA_ROOT=${GQLA_ROOT:-/mnt/tidalfs-alwl01/task/236362/GQLA}
 CODE_ROOT=${CODE_ROOT:-$GQLA_ROOT/code}
+ENV_ROOT=${ENV_ROOT:-$GQLA_ROOT/envs}
 MODEL_DIR=${MODEL_DIR:-$GQLA_ROOT/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract}
 GQLA_DST=${GQLA_DST:-$CODE_ROOT/GQLA_preprint}
 HPC_DST=${HPC_DST:-$CODE_ROOT/hpc-ops}
@@ -60,6 +64,45 @@ if [[ "$(uname -m)" == x86_64 ]] && [[ -f "$UV_BUNDLE_ARCHIVE" ]]; then
   [[ "$("$GQLA_DST/tools/uv" --version)" == "uv 0.9.3" ]] || \
     die "bundled uv failed its version check"
   echo "[deploy] installed verified bundled uv 0.9.3 -> $GQLA_DST/tools/uv"
+fi
+
+if [[ "$(uname -m)" == x86_64 ]] && [[ -f "$PYTHON_BUNDLE_ARCHIVE" ]]; then
+  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+  command -v tar >/dev/null 2>&1 || die "tar is required"
+  python_archive_actual_sha256=$(sha256sum "$PYTHON_BUNDLE_ARCHIVE" | awk '{print $1}')
+  [[ "$python_archive_actual_sha256" == "$PYTHON_BUNDLE_SHA256" ]] || \
+    die "bundled CPython archive SHA256 mismatch"
+
+  python_install_root=$ENV_ROOT/python
+  python_install_dir=$python_install_root/cpython-3.12.12-linux-x86_64-gnu
+  python_binary=$python_install_dir/bin/python3.12
+  python_ready=0
+  if [[ -x "$python_binary" ]]; then
+    python_binary_actual_sha256=$(sha256sum "$python_binary" | awk '{print $1}')
+    if [[ "$python_binary_actual_sha256" == "$PYTHON_BINARY_SHA256" ]]; then
+      python_ready=1
+    fi
+  fi
+
+  if [[ "$python_ready" == 0 ]]; then
+    mkdir -p "$python_install_root"
+    python_bundle_tmp=$(mktemp -d "$ENV_ROOT/.python-bundle.XXXXXX")
+    tar -xJf "$PYTHON_BUNDLE_ARCHIVE" -C "$python_bundle_tmp"
+    python_staged_dir=$python_bundle_tmp/cpython-3.12.12-linux-x86_64-gnu
+    python_staged_binary=$python_staged_dir/bin/python3.12
+    [[ -x "$python_staged_binary" ]] || die "bundled CPython executable is missing"
+    python_binary_actual_sha256=$(sha256sum "$python_staged_binary" | awk '{print $1}')
+    [[ "$python_binary_actual_sha256" == "$PYTHON_BINARY_SHA256" ]] || \
+      die "bundled CPython binary SHA256 mismatch"
+    if [[ -e "$python_install_dir" ]]; then
+      mv "$python_install_dir" "$python_install_dir.previous.$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    mv "$python_staged_dir" "$python_install_dir"
+    rmdir "$python_bundle_tmp"
+  fi
+  [[ "$("$python_binary" --version)" == "Python 3.12.12" ]] || \
+    die "bundled CPython failed its version check"
+  echo "[deploy] installed verified bundled CPython 3.12.12 -> $python_install_dir"
 fi
 
 if [[ ! -d "$HPC_DST/.git" ]]; then
