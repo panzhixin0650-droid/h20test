@@ -100,6 +100,12 @@ assert all(version(name) == wanted for name, wanted in expected.items())
 PY
 }
 
+build_tools_are_ready() {
+    [[ -x "$VENV_DIR/bin/cmake" && -x "$VENV_DIR/bin/ninja" ]] || return 1
+    "$VENV_DIR/bin/cmake" --version >/dev/null 2>&1 || return 1
+    "$VENV_DIR/bin/ninja" --version >/dev/null 2>&1 || return 1
+}
+
 find_cuda_toolkit() {
     local candidate release
     local -a candidates=()
@@ -285,6 +291,13 @@ if [[ "$FORCE_CORE_REINSTALL" == 1 ]] || ! core_stack_is_ready; then
     "$UV_BIN" "${install_args[@]}"
 else
     echo "[bootstrap] pinned torch/vLLM/transformers stack already present"
+fi
+
+if ! build_tools_are_ready; then
+    echo "[bootstrap] installing/repairing CMake, Ninja, setuptools, and wheel"
+    "$UV_BIN" pip install --no-config --python "$PYTHON" --reinstall \
+        'cmake>=3.26,<4' 'ninja>=1.12' 'setuptools==80.10.2' 'wheel>=0.45.1'
+    build_tools_are_ready || die "CMake/Ninja installation did not create working executables"
 fi
 
 export PATH="$VENV_DIR/bin:$PATH"
