@@ -9,9 +9,16 @@ The deployment script checks that the converted checkpoint is already at:
 /mnt/tidalfs-alwl01/task/236362/GQLA/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract
 ```
 
-It copies the bundled plugin to `GQLA/code/GQLA_preprint`, fetches Tencent
-HPC-Ops at commit `83165c3f7d1f2a4aa0bd1f8c0f37fab771b5190b`, and applies the
-runtime-softmax-scale patch stored in this repository.
+It copies the bundled plugin to `GQLA/code/GQLA_preprint` and unpacks a
+SHA256-verified HPC-Ops source archive at local revision `f85ce84`. That source
+contains both local commits required by this integration:
+
+- `83165c3`: GQLA QK192/V128 BF16 decode support, based on Tencent `1cd3329`.
+- `f85ce84`: runtime softmax scale and build/bootstrap fixes.
+
+The archive contains source only—no wheel, build tree, or model data. Keeping
+the exact 4 MB source archive in this transit branch avoids depending on a
+local-only commit that Tencent GitHub cannot serve.
 
 ## Clone and deploy
 
@@ -44,8 +51,8 @@ tar -xzf /tmp/h20test-h20-vllm.tar.gz \
 bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
 ```
 
-The deployer also has this Git-to-codeload fallback for its pinned HPC-Ops
-download, so the same Git/GnuTLS failure will not block the second repository.
+The H20 deployment no longer needs a second GitHub request for HPC-Ops: its
+verified source archive is already inside this transit bundle.
 
 Deploy and immediately create/check the environment in one command:
 

@@ -8,6 +8,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 BUNDLE_DIR="$SCRIPT_DIR/GQLA_preprint"
 PATCH_FILE="$REPO_ROOT/patches/0001-Add-runtime-attention-scale-for-GQLA-serving.patch"
+HPC_BUNDLE_ARCHIVE="$SCRIPT_DIR/hpc-ops-f85ce84.tar.gz"
+HPC_BUNDLE_SHA256=dd5a668ee454683a81d8857988e4285e9c1558d39cec92664c981e7b8c562e7e
 
 GQLA_ROOT=${GQLA_ROOT:-/mnt/tidalfs-alwl01/task/236362/GQLA}
 CODE_ROOT=${CODE_ROOT:-$GQLA_ROOT/code}
@@ -16,6 +18,7 @@ GQLA_DST=${GQLA_DST:-$CODE_ROOT/GQLA_preprint}
 HPC_DST=${HPC_DST:-$CODE_ROOT/hpc-ops}
 HPC_REMOTE=${HPC_REMOTE:-https://github.com/Tencent/hpc-ops.git}
 HPC_BASE_COMMIT=83165c3f7d1f2a4aa0bd1f8c0f37fab771b5190b
+HPC_SOURCE_COMMIT=f85ce8457ce6ef46c4c89736576792f14533cc48
 HPC_ARCHIVE_URL=${HPC_ARCHIVE_URL:-https://codeload.github.com/Tencent/hpc-ops/tar.gz/$HPC_BASE_COMMIT}
 RUN_INSTALL=${RUN_INSTALL:-0}
 
@@ -46,7 +49,18 @@ if [[ ! -d "$HPC_DST/.git" ]]; then
   hpc_fetch_src="$hpc_fetch_tmp/source"
   hpc_fetch_archive="$hpc_fetch_tmp/hpc-ops.tar.gz"
 
-  if (
+  if [[ -f "$HPC_BUNDLE_ARCHIVE" ]]; then
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+    command -v tar >/dev/null 2>&1 || die "tar is required"
+    hpc_bundle_actual_sha256=$(sha256sum "$HPC_BUNDLE_ARCHIVE" | awk '{print $1}')
+    [[ "$hpc_bundle_actual_sha256" == "$HPC_BUNDLE_SHA256" ]] || \
+      die "bundled HPC-Ops archive SHA256 mismatch"
+    mkdir -p "$hpc_fetch_src"
+    tar -xzf "$HPC_BUNDLE_ARCHIVE" --strip-components=1 -C "$hpc_fetch_src"
+    git -C "$hpc_fetch_src" init -q
+    printf '%s\n' "$HPC_SOURCE_COMMIT" >"$hpc_fetch_src/.gqla_hpc_source_commit"
+    echo "[deploy] unpacked verified bundled HPC-Ops source $HPC_SOURCE_COMMIT"
+  elif (
     set -Eeuo pipefail
     mkdir -p "$hpc_fetch_src"
     git -C "$hpc_fetch_src" init -q
@@ -99,6 +113,7 @@ cat >"$CODE_ROOT/H20_VLLM_DEPLOYMENT.txt" <<EOF
 GQLA source: $GQLA_DST
 HPC-Ops source: $HPC_DST
 HPC-Ops base: $HPC_BASE_COMMIT
+HPC-Ops source revision: $HPC_SOURCE_COMMIT
 HPC-Ops patch: $(basename "$PATCH_FILE")
 Converted model: $MODEL_DIR
 EOF
