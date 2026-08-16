@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # One command for a fresh H20 node: reuse a CUDA PyTorch environment when one
-# exists, otherwise prepare a minimal persistent environment with aria2 + uv,
+# exists, otherwise prepare a minimal persistent environment with aria2,
 # then run the seven-day stress test in the same tmux session.
 
 set -Eeuo pipefail
@@ -21,7 +21,6 @@ torch_wheel_url=${GPU_STRESS_TORCH_WHEEL_URL:-https://download.pytorch.org/whl/c
 torch_wheel_min_bytes=800000000
 pypi_index=${GPU_STRESS_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
 pypi_fallback=${GPU_STRESS_PYPI_FALLBACK_INDEX:-https://pypi.org/simple}
-uv_version=${GPU_STRESS_UV_VERSION:-0.9.3}
 aria2_file_connections=${GPU_STRESS_ARIA2_FILE_CONNECTIONS:-8}
 aria2_parallel_files=${GPU_STRESS_ARIA2_PARALLEL_FILES:-8}
 
@@ -232,14 +231,13 @@ wheel_dir="$cache_root/wheels/cu128"
 wheel_path="$wheel_dir/$torch_wheel_name"
 conda_packages="$cache_root/conda-pkgs"
 pip_cache="$cache_root/pip-cache"
-uv_cache="$cache_root/uv-cache"
 wheelhouse="$cache_root/wheelhouse/cu128-py312"
 manifest_dir="$cache_root/manifests"
 dependency_report="$manifest_dir/torch-cu128-py312-report.json"
 aria2_manifest="$manifest_dir/torch-cu128-py312-aria2.txt"
 manifest_builder="$script_dir/build_aria2_wheel_manifest.py"
 mkdir -p -- \
-    "$wheel_dir" "$conda_packages" "$pip_cache" "$uv_cache" \
+    "$wheel_dir" "$conda_packages" "$pip_cache" \
     "$wheelhouse" "$manifest_dir"
 
 export CONDA_PKGS_DIRS="$conda_packages"
@@ -432,30 +430,6 @@ if [[ -z "$python_bin" ]]; then
     fi
     python_bin="$env_prefix/bin/python"
 
-    if [[ -x "$env_prefix/bin/uv" ]]; then
-        uv_bin="$env_prefix/bin/uv"
-    elif command -v uv >/dev/null 2>&1; then
-        uv_bin=$(command -v uv)
-    else
-        printf 'Installing uv %s from the primary mirror...\n' "$uv_version"
-        if ! "$python_bin" -m pip install \
-            --index-url "$pypi_index" \
-            --timeout 120 \
-            --retries 10 \
-            "uv==$uv_version"; then
-            "$python_bin" -m pip install \
-                --index-url "$pypi_fallback" \
-                --timeout 120 \
-                --retries 10 \
-                "uv==$uv_version"
-        fi
-        uv_bin="$env_prefix/bin/uv"
-    fi
-    if [[ ! -x "$uv_bin" ]]; then
-        printf 'uv executable is unavailable after installation: %s\n' "$uv_bin" >&2
-        exit 2
-    fi
-
     if ! wait "$download_pid"; then
         download_pid=
         printf '%s\n' 'Torch wheel download failed.' >&2
@@ -498,20 +472,12 @@ if [[ -z "$python_bin" ]]; then
         --summary-interval=5
 
     printf '%s\n' 'Installing Torch completely offline from the aria2 wheelhouse...'
-    env \
-        -u PIP_INDEX_URL \
-        -u PIP_EXTRA_INDEX_URL \
-        UV_CACHE_DIR="$uv_cache" \
-        UV_LINK_MODE=copy \
-        UV_CONCURRENT_DOWNLOADS=${GPU_STRESS_UV_CONCURRENT_DOWNLOADS:-16} \
-        "$uv_bin" pip install \
-            --python "$python_bin" \
+    env -u PIP_INDEX_URL -u PIP_EXTRA_INDEX_URL \
+        "$python_bin" -m pip install \
             --no-index \
             --find-links "$wheelhouse" \
             --find-links "$wheel_dir" \
             --only-binary :all: \
-            --link-mode copy \
-            --strict \
             'setuptools<82' \
             "$wheel_path"
     "$python_bin" -m pip check

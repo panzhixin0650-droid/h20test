@@ -26,7 +26,7 @@
 2. 若没有，则自动检测任务持久挂载并创建最小 Python 3.12 环境；
 3. 使用 `aria2c` 多路断点续传 Torch wheel，同时创建 Conda 环境；
 4. 先解析 Torch 的完整依赖和 wheel 直链，再让 aria2 批量并发下载所有依赖；
-5. 使用 `uv --no-index` 从本地 wheelhouse 完全离线安装；
+5. 使用 `pip --no-index` 从本地 wheelhouse 完全离线安装；
 6. 校验 CUDA 和 GPU 后，在同一个 `gpu-stress-7d` tmux 中启动七天压测。
 
 指定多卡或缓存位置：
@@ -36,7 +36,7 @@
 ./bootstrap_and_start_gpu_stress_7d.sh all --cache-root /persistent/path/gpu-stress
 ```
 
-下载、Conda 包、uv/pip 缓存和环境会持久化，并与仓库的 FlashInfer H20 one-click
+下载、Conda 包、pip 缓存和环境会持久化，并与仓库的 FlashInfer H20 one-click
 共享 `.../panzhixin/GQLA` 缓存根；中断后重新运行同一条命令即可续传和复用，不会
 重新下载完整 wheel。查看安装或压测过程：
 
