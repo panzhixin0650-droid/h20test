@@ -17,10 +17,10 @@ foreground=0
 worker=0
 
 torch_wheel_name='torch-2.11.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl'
-torch_wheel_url=${GPU_STRESS_TORCH_WHEEL_URL:-https://download.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl}
+torch_wheel_url=${GPU_STRESS_TORCH_WHEEL_URL:-https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl}
 torch_wheel_min_bytes=800000000
 pypi_index=${GPU_STRESS_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
-pypi_fallback=${GPU_STRESS_PYPI_FALLBACK_INDEX:-https://pypi.org/simple}
+pypi_fallback=${GPU_STRESS_PYPI_FALLBACK_INDEX:-}
 aria2_file_connections=${GPU_STRESS_ARIA2_FILE_CONNECTIONS:-8}
 aria2_parallel_files=${GPU_STRESS_ARIA2_PARALLEL_FILES:-8}
 
@@ -250,6 +250,13 @@ printf '\n===== GPU stress one-click bootstrap: %s =====\n' \
 printf 'Repository: %s\n' "$repo_root"
 printf 'Cache root: %s\n' "$cache_root"
 printf 'GPU selection: %s\n' "$gpu_selection"
+printf 'Torch wheel source: %s\n' "$torch_wheel_url"
+printf 'Python dependency index: %s\n' "$pypi_index"
+if [[ -n "$pypi_fallback" ]]; then
+    printf 'Python dependency fallback: %s\n' "$pypi_fallback"
+else
+    printf '%s\n' 'Python dependency fallback: disabled'
+fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     printf '%s\n' 'nvidia-smi is required but unavailable.' >&2
@@ -438,12 +445,15 @@ if [[ -z "$python_bin" ]]; then
     download_pid=
 
     printf '%s\n' 'Resolving the complete Torch wheel set (metadata only)...'
+    pip_index_args=(--index-url "$pypi_index")
+    if [[ -n "$pypi_fallback" ]]; then
+        pip_index_args+=(--extra-index-url "$pypi_fallback")
+    fi
     "$python_bin" -m pip install \
         --dry-run \
         --ignore-installed \
         --report "$dependency_report" \
-        --index-url "$pypi_index" \
-        --extra-index-url "$pypi_fallback" \
+        "${pip_index_args[@]}" \
         --only-binary :all: \
         'setuptools<82' \
         "$wheel_path"

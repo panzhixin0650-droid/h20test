@@ -24,8 +24,8 @@
 
 1. 复用任意已有且能访问 CUDA GPU 的 PyTorch 环境；
 2. 若没有，则自动检测任务持久挂载并创建最小 Python 3.12 环境；
-3. 使用 `aria2c` 多路断点续传 Torch wheel，同时创建 Conda 环境；
-4. 先解析 Torch 的完整依赖和 wheel 直链，再让 aria2 批量并发下载所有依赖；
+3. 从阿里云 PyTorch cu128 镜像使用 `aria2c` 多路断点续传 Torch wheel，同时创建 Conda 环境；
+4. 只从清华 PyPI 镜像解析其余依赖，再让 aria2 批量并发下载所有依赖；
 5. 使用 `pip --no-index` 从本地 wheelhouse 完全离线安装；
 6. 校验 CUDA 和 GPU 后，在同一个 `gpu-stress-7d` tmux 中启动七天压测。
 
