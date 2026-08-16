@@ -1,5 +1,28 @@
 # H20 vLLM deployment bundle
 
+## Aliyun-only clean environment
+
+When the source tree and converted checkpoint are already present, run the
+standalone installer below. It creates `GQLA/envs/h20-aliyun-py312`; it does
+not reuse `venv-py312`. All 194 pinned Python wheels are resolved from
+`https://mirrors.aliyun.com/pypi/simple/`, downloaded concurrently by aria2
+with the mirror-published SHA256, audited for CPython 3.12/glibc x86-64, and
+installed offline with `--no-index`. The model is never downloaded.
+
+```bash
+R=/mnt/public03/task/236362/GQLA
+export GQLA_ROOT=$R
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+bash $R/code/GQLA_preprint/scripts/setup_h20_aliyun_env.sh
+```
+
+Success is reported only after CUDA, all eight H20s, both vLLM model
+registrations, and the rebuilt patched HPC-Ops ABI have passed bootstrap:
+
+```text
+H20_ALIYUN_SETUP_OK
+```
+
 ## Recommended: clean cu129 environment plus one-case benchmark
 
 The current H20 DLC host exposes a CUDA 12.x driver. The two scripts below do
