@@ -17,8 +17,8 @@ if [[ -d $E ]]; then
     conda env remove -y -p "$E"
 fi
 
-echo "creating minimal Python 3.10 + pip from the local Conda cache"
-conda create -y -p "$E" --offline python=3.10 pip
+echo "downloading a fresh minimal Conda Python 3.10 + pip environment"
+conda create -y -p "$E" python=3.10 pip
 P=$E/bin/python
 "$P" - <<'PY'
 import sys
