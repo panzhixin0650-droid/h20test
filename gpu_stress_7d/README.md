@@ -52,6 +52,9 @@ GPU_STRESS_ARIA2_FILE_CONNECTIONS=8 \
 ./bootstrap_and_start_gpu_stress_7d.sh all
 ```
 
+aria2 安装会先复用现有 apt 索引；只有直接安装失败时才刷新索引。apt 锁等待、连接
+和总执行时间均有限制，不会在不可用的软件源上无限静默等待。
+
 ### 已有 CUDA PyTorch 环境
 
 单卡 GPU 0：

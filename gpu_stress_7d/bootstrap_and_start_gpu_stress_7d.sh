@@ -307,7 +307,7 @@ add_python_candidate python3
 if command -v conda >/dev/null 2>&1; then
     while read -r conda_prefix; do
         add_python_candidate "$conda_prefix/bin/python"
-    done < <(conda env list | awk 'NF && $1 !~ /^#/ {print $NF}')
+    done < <(conda env list 2>/dev/null | awk 'NF && $1 !~ /^#/ {print $NF}')
 fi
 
 python_bin=
@@ -333,10 +333,31 @@ install_aria2_if_possible() {
     command -v aria2c >/dev/null 2>&1 && return 0
     [[ $(id -u) == 0 ]] || return 1
     command -v apt-get >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    local -a apt_options
+    apt_options=(
+        -o Acquire::Retries=2
+        -o Acquire::http::Timeout=15
+        -o Acquire::https::Timeout=15
+        -o DPkg::Lock::Timeout=30
+    )
     printf 'Installing aria2 for up to %s connections per wheel...\n' \
         "$aria2_file_connections"
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y aria2 || return 1
+
+    # Most cluster images already have usable apt indexes. Try this fast path
+    # before an update, which can hang silently on an unreachable mirror.
+    if timeout 90 env DEBIAN_FRONTEND=noninteractive \
+        apt-get "${apt_options[@]}" install -y aria2; then
+        command -v aria2c >/dev/null 2>&1
+        return
+    fi
+
+    printf '%s\n' \
+        'Direct apt install failed; refreshing package indexes with a 120s limit...'
+    timeout 120 env DEBIAN_FRONTEND=noninteractive \
+        apt-get "${apt_options[@]}" update || return 1
+    timeout 90 env DEBIAN_FRONTEND=noninteractive \
+        apt-get "${apt_options[@]}" install -y aria2 || return 1
     command -v aria2c >/dev/null 2>&1
 }
 
