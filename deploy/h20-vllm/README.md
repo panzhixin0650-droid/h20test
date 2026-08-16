@@ -40,6 +40,21 @@ The benchmark script never installs packages. MLA must resolve to
 `FLASH_ATTN_MLA`; GQLA runs with strict tracing and is accepted only when the
 HPC kernel records a hit with no eligible-decode fallback.
 
+After a failed or interrupted matrix, run the read-only environment/log
+diagnostic against its session directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash deploy/h20-vllm/diagnose_h20_env_and_run.sh \
+  /path/to/dsv3p1_g8_h20_tp8_all/h20-tp8-all-...-attempt0
+```
+
+It discovers the exact Python recorded by `manifest.env` when possible, checks
+Torch/CUDA on all eight GPUs, the vLLM architecture registry, the patched HPC
+schema, and every checkpoint shard. It then classifies common failures and
+prints focused tails from the launcher, server, and benchmark logs. It never
+installs packages or changes the environment.
+
 This directory transfers the GQLA vLLM plugin, H20 environment bootstrap, and
 benchmark launchers. It does **not** contain or modify the converted model.
 
