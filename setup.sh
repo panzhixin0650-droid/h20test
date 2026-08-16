@@ -51,6 +51,7 @@ export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export CUDACXX=$CUDA_HOME/bin/nvcc
 export CMAKE_PREFIX_PATH=$("$P" -c 'import torch; print(torch.utils.cmake_prefix_path)')
 export CMAKE_GENERATOR=Ninja
+export HPC_GIT_HASH_OVERRIDE=${HPC_GIT_HASH_OVERRIDE:-501420c}
 
 echo "building patched HPC-Ops"
 B=$E/hpc-build
