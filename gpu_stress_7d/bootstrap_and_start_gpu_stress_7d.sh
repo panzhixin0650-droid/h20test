@@ -19,10 +19,10 @@ worker=0
 torch_wheel_name='torch-2.11.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl'
 torch_wheel_url=${GPU_STRESS_TORCH_WHEEL_URL:-https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl}
 torch_wheel_min_bytes=800000000
-pypi_index=${GPU_STRESS_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
+pypi_index=${GPU_STRESS_PYPI_INDEX:-https://mirrors.aliyun.com/pypi/simple}
 pypi_fallback=${GPU_STRESS_PYPI_FALLBACK_INDEX:-}
-aria2_file_connections=${GPU_STRESS_ARIA2_FILE_CONNECTIONS:-8}
-aria2_parallel_files=${GPU_STRESS_ARIA2_PARALLEL_FILES:-8}
+aria2_file_connections=${GPU_STRESS_ARIA2_FILE_CONNECTIONS:-4}
+aria2_parallel_files=${GPU_STRESS_ARIA2_PARALLEL_FILES:-4}
 
 usage() {
     cat <<'EOF'
