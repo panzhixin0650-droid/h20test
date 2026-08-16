@@ -1,5 +1,45 @@
 # H20 vLLM deployment bundle
 
+## Recommended: clean cu129 environment plus one-case benchmark
+
+The current H20 DLC host exposes a CUDA 12.x driver. The two scripts below do
+not reuse a copied virtual environment and do not require the CUDA 13 forward
+compatibility workaround:
+
+1. `setup_h20_cu129_env.sh` creates `GQLA/envs/h20-cu129-py312`, downloads the
+   official Torch 2.11 cu129 and vLLM 0.22.1 cu129 release wheels with aria2.
+   It also resolves the pinned cuBLAS, cuDNN, NCCL, FlashInfer cubin, Triton,
+   and other large wheels from official PyPI metadata and gives every wheel at
+   least 32 MiB to aria2. uv installs the remaining dependency closure
+   concurrently. The script then deploys the GQLA/HPC sources embedded in this
+   GitHub relay, applies the runtime `softmax_scale` patch, and builds HPC-Ops
+   against the exact Torch ABI.
+2. `run_h20_tp8_benchmark.sh` runs exactly one fresh-server case. The route is
+   `mla` or `gqla`; the profile is `2k`, `8k`, `16k`, or `16k-b20`.
+
+```bash
+GQLA_ROOT=/mnt/public03/task/236362/GQLA \
+MODEL_DIR=/mnt/public03/task/236362/GQLA/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash deploy/h20-vllm/setup_h20_cu129_env.sh
+```
+
+Each benchmark is explicitly launched and recorded separately:
+
+```bash
+GQLA_ROOT=/mnt/public03/task/236362/GQLA \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash deploy/h20-vllm/run_h20_tp8_benchmark.sh mla 2k
+
+GQLA_ROOT=/mnt/public03/task/236362/GQLA \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash deploy/h20-vllm/run_h20_tp8_benchmark.sh gqla 2k
+```
+
+The benchmark script never installs packages. MLA must resolve to
+`FLASH_ATTN_MLA`; GQLA runs with strict tracing and is accepted only when the
+HPC kernel records a hit with no eligible-decode fallback.
+
 This directory transfers the GQLA vLLM plugin, H20 environment bootstrap, and
 benchmark launchers. It does **not** contain or modify the converted model.
 
