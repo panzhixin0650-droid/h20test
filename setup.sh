@@ -2,14 +2,13 @@
 set -Eeuo pipefail
 
 R=${GQLA_ROOT:-/mnt/public03/task/236362/GQLA}
-E=${CONDA_ENV_DIR:-$R/envs/h20-conda-py312}
+E=${CONDA_ENV_DIR:-$R/envs/h20-conda310}
 G=$R/code/GQLA_preprint
 H=$R/code/hpc-ops
 M=https://mirrors.aliyun.com/pypi/simple
 D=$R/envs/downloads/cuda-compat-13-0_580.178.04-1ubuntu1_amd64.deb
 
 command -v conda >/dev/null || { echo "conda not found"; exit 2; }
-BASE=${BASE_CONDA_ENV:-${CONDA_PREFIX:-$(conda info --base)}}
 [[ -f $G/pyproject.toml ]] || { echo "missing $G"; exit 2; }
 [[ -f $H/setup.py ]] || { echo "missing $H"; exit 2; }
 
@@ -18,8 +17,8 @@ if [[ -d $E ]]; then
     conda env remove -y -p "$E"
 fi
 
-echo "cloning local Conda base without downloading Conda packages"
-conda create -y -p "$E" --clone "$BASE"
+echo "creating minimal Python 3.10 + pip from the local Conda cache"
+conda create -y -p "$E" --offline python=3.10 pip
 P=$E/bin/python
 "$P" - <<'PY'
 import sys
