@@ -194,6 +194,11 @@ if (( worker == 0 && foreground == 0 )); then
         -e "CHECK_INTERVAL=${CHECK_INTERVAL:-10}" \
         -e "MATRIX_SIZE=${MATRIX_SIZE:-0}" \
         -e "MEMORY_FRACTION=${MEMORY_FRACTION:-0.45}" \
+        -e "GPU_STRESS_TORCH_WHEEL_URL=$torch_wheel_url" \
+        -e "GPU_STRESS_PYPI_INDEX=$pypi_index" \
+        -e "GPU_STRESS_PYPI_FALLBACK_INDEX=$pypi_fallback" \
+        -e "GPU_STRESS_ARIA2_FILE_CONNECTIONS=$aria2_file_connections" \
+        -e "GPU_STRESS_ARIA2_PARALLEL_FILES=$aria2_parallel_files" \
         "$tmux_command"
 
     sleep 3
