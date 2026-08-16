@@ -24,9 +24,10 @@
 
 1. 复用任意已有且能访问 CUDA GPU 的 PyTorch 环境；
 2. 若没有，则自动检测任务持久挂载并创建最小 Python 3.12 环境；
-3. 使用 `aria2c` 16 路断点续传 Torch wheel，同时创建 Conda 环境；
-4. 使用 `uv` 并发下载并安装 Torch 的运行时依赖；
-5. 校验 CUDA 和 GPU 后，在同一个 `gpu-stress-7d` tmux 中启动七天压测。
+3. 使用 `aria2c` 多路断点续传 Torch wheel，同时创建 Conda 环境；
+4. 先解析 Torch 的完整依赖和 wheel 直链，再让 aria2 批量并发下载所有依赖；
+5. 使用 `uv --no-index` 从本地 wheelhouse 完全离线安装；
+6. 校验 CUDA 和 GPU 后，在同一个 `gpu-stress-7d` tmux 中启动七天压测。
 
 指定多卡或缓存位置：
 
@@ -41,6 +42,14 @@
 
 ```bash
 tmux attach -t gpu-stress-7d
+```
+
+默认同时下载 8 个 wheel、每个 wheel 最多 8 个连接；可以按网络情况调整：
+
+```bash
+GPU_STRESS_ARIA2_PARALLEL_FILES=12 \
+GPU_STRESS_ARIA2_FILE_CONNECTIONS=8 \
+./bootstrap_and_start_gpu_stress_7d.sh all
 ```
 
 ### 已有 CUDA PyTorch 环境

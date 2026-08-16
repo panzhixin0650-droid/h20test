@@ -22,6 +22,8 @@ torch_wheel_min_bytes=800000000
 pypi_index=${GPU_STRESS_PYPI_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
 pypi_fallback=${GPU_STRESS_PYPI_FALLBACK_INDEX:-https://pypi.org/simple}
 uv_version=${GPU_STRESS_UV_VERSION:-0.9.3}
+aria2_file_connections=${GPU_STRESS_ARIA2_FILE_CONNECTIONS:-8}
+aria2_parallel_files=${GPU_STRESS_ARIA2_PARALLEL_FILES:-8}
 
 usage() {
     cat <<'EOF'
@@ -98,6 +100,17 @@ if [[ "$gpu_selection" != all && ! "$gpu_selection" =~ ^[0-9]+(,[0-9]+)*$ ]]; th
 fi
 if [[ ! "$session_name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     printf 'Unsafe tmux session name: %q\n' "$session_name" >&2
+    exit 2
+fi
+for positive_integer in "$aria2_file_connections" "$aria2_parallel_files"; do
+    if [[ ! "$positive_integer" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'aria2 concurrency values must be positive integers, got %q\n' \
+            "$positive_integer" >&2
+        exit 2
+    fi
+done
+if (( aria2_file_connections > 16 )); then
+    printf 'GPU_STRESS_ARIA2_FILE_CONNECTIONS cannot exceed aria2 limit 16.\n' >&2
     exit 2
 fi
 
@@ -220,7 +233,14 @@ wheel_path="$wheel_dir/$torch_wheel_name"
 conda_packages="$cache_root/conda-pkgs"
 pip_cache="$cache_root/pip-cache"
 uv_cache="$cache_root/uv-cache"
-mkdir -p -- "$wheel_dir" "$conda_packages" "$pip_cache" "$uv_cache"
+wheelhouse="$cache_root/wheelhouse/cu128-py312"
+manifest_dir="$cache_root/manifests"
+dependency_report="$manifest_dir/torch-cu128-py312-report.json"
+aria2_manifest="$manifest_dir/torch-cu128-py312-aria2.txt"
+manifest_builder="$script_dir/build_aria2_wheel_manifest.py"
+mkdir -p -- \
+    "$wheel_dir" "$conda_packages" "$pip_cache" "$uv_cache" \
+    "$wheelhouse" "$manifest_dir"
 
 export CONDA_PKGS_DIRS="$conda_packages"
 export PIP_CACHE_DIR="$pip_cache"
@@ -258,6 +278,11 @@ probe_cuda_python() {
         CUDA_VISIBLE_DEVICES="$first_gpu" \
         "$candidate_python" -c "$probe_code"
 }
+
+if [[ ! -f "$manifest_builder" ]]; then
+    printf 'aria2 manifest builder is absent: %s\n' "$manifest_builder" >&2
+    exit 2
+fi
 
 python_candidates=()
 add_python_candidate() {
@@ -308,7 +333,8 @@ install_aria2_if_possible() {
     command -v aria2c >/dev/null 2>&1 && return 0
     [[ $(id -u) == 0 ]] || return 1
     command -v apt-get >/dev/null 2>&1 || return 1
-    printf '%s\n' 'Installing aria2 for 16-connection resumable download...'
+    printf 'Installing aria2 for up to %s connections per wheel...\n' \
+        "$aria2_file_connections"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
     DEBIAN_FRONTEND=noninteractive apt-get install -y aria2 || return 1
     command -v aria2c >/dev/null 2>&1
@@ -331,36 +357,25 @@ download_torch_wheel() {
     fi
 
     printf 'Downloading Torch wheel: %s\n' "$wheel_path"
-    if command -v aria2c >/dev/null 2>&1; then
-        aria2c \
-            --continue=true \
-            --max-connection-per-server=16 \
-            --split=16 \
-            --min-split-size=4M \
-            --file-allocation=none \
-            --auto-file-renaming=false \
-            --connect-timeout=15 \
-            --timeout=30 \
-            --max-tries=0 \
-            --retry-wait=2 \
-            --summary-interval=5 \
-            --dir="$wheel_dir" \
-            --out="$torch_wheel_name" \
-            "$torch_wheel_url"
-    else
-        printf '%s\n' 'aria2 is unavailable; falling back to resumable IPv4 curl.'
-        curl -4 \
-            --fail \
-            --location \
-            --continue-at - \
-            --connect-timeout 20 \
-            --speed-limit 1024 \
-            --speed-time 60 \
-            --retry 30 \
-            --retry-delay 2 \
-            --output "$wheel_path" \
-            "$torch_wheel_url"
+    if ! command -v aria2c >/dev/null 2>&1; then
+        printf '%s\n' 'aria2 is required for the fast bootstrap but is unavailable.' >&2
+        return 2
     fi
+    aria2c \
+        --continue=true \
+        --max-connection-per-server="$aria2_file_connections" \
+        --split="$aria2_file_connections" \
+        --min-split-size=4M \
+        --file-allocation=none \
+        --auto-file-renaming=false \
+        --connect-timeout=15 \
+        --timeout=30 \
+        --max-tries=0 \
+        --retry-wait=2 \
+        --summary-interval=5 \
+        --dir="$wheel_dir" \
+        --out="$torch_wheel_name" \
+        "$torch_wheel_url"
     wheel_is_complete
     printf 'TORCH_WHEEL_OK path=%s size_bytes=%s\n' \
         "$wheel_path" "$(stat -c %s "$wheel_path")"
@@ -380,7 +395,11 @@ if [[ -z "$python_bin" ]]; then
         printf '%s\n' 'No compatible PyTorch environment exists and conda is unavailable.' >&2
         exit 2
     fi
-    install_aria2_if_possible || true
+    if ! install_aria2_if_possible; then
+        printf '%s\n' \
+            'Cannot install aria2 automatically; install aria2c and rerun.' >&2
+        exit 2
+    fi
     download_torch_wheel &
     download_pid=$!
 
@@ -423,7 +442,41 @@ if [[ -z "$python_bin" ]]; then
     fi
     download_pid=
 
-    printf '%s\n' 'Installing minimal Torch runtime with concurrent uv downloads...'
+    printf '%s\n' 'Resolving the complete Torch wheel set (metadata only)...'
+    "$python_bin" -m pip install \
+        --dry-run \
+        --ignore-installed \
+        --report "$dependency_report" \
+        --index-url "$pypi_index" \
+        --extra-index-url "$pypi_fallback" \
+        --only-binary :all: \
+        'setuptools<82' \
+        "$wheel_path"
+    "$python_bin" "$manifest_builder" \
+        --report "$dependency_report" \
+        --destination "$wheelhouse" \
+        --output "$aria2_manifest"
+
+    printf '%s\n' \
+        'Downloading every resolved dependency wheel with aria2...'
+    aria2c \
+        --input-file="$aria2_manifest" \
+        --continue=true \
+        --max-concurrent-downloads="$aria2_parallel_files" \
+        --max-connection-per-server="$aria2_file_connections" \
+        --split="$aria2_file_connections" \
+        --min-split-size=4M \
+        --file-allocation=none \
+        --auto-file-renaming=false \
+        --allow-overwrite=false \
+        --check-integrity=true \
+        --connect-timeout=15 \
+        --timeout=30 \
+        --max-tries=0 \
+        --retry-wait=2 \
+        --summary-interval=5
+
+    printf '%s\n' 'Installing Torch completely offline from the aria2 wheelhouse...'
     env \
         -u PIP_INDEX_URL \
         -u PIP_EXTRA_INDEX_URL \
@@ -432,9 +485,9 @@ if [[ -z "$python_bin" ]]; then
         UV_CONCURRENT_DOWNLOADS=${GPU_STRESS_UV_CONCURRENT_DOWNLOADS:-16} \
         "$uv_bin" pip install \
             --python "$python_bin" \
-            --index "$pypi_index" \
-            --default-index "$pypi_fallback" \
-            --index-strategy unsafe-best-match \
+            --no-index \
+            --find-links "$wheelhouse" \
+            --find-links "$wheel_dir" \
             --only-binary :all: \
             --link-mode copy \
             --strict \
