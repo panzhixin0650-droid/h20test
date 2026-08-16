@@ -6,10 +6,10 @@ E=${CONDA_ENV_DIR:-$R/envs/h20-conda-py312}
 G=$R/code/GQLA_preprint
 H=$R/code/hpc-ops
 M=https://mirrors.aliyun.com/pypi/simple
-C=https://mirrors.aliyun.com/anaconda/pkgs/main
 D=$R/envs/downloads/cuda-compat-13-0_580.178.04-1ubuntu1_amd64.deb
 
 command -v conda >/dev/null || { echo "conda not found"; exit 2; }
+BASE=${BASE_CONDA_ENV:-${CONDA_PREFIX:-$(conda info --base)}}
 [[ -f $G/pyproject.toml ]] || { echo "missing $G"; exit 2; }
 [[ -f $H/setup.py ]] || { echo "missing $H"; exit 2; }
 
@@ -18,9 +18,15 @@ if [[ -d $E ]]; then
     conda env remove -y -p "$E"
 fi
 
-echo "creating Conda environment from Aliyun"
-conda create -y -p "$E" --override-channels -c "$C" python=3.12 pip
+echo "cloning local Conda base without downloading Conda packages"
+conda create -y -p "$E" --clone "$BASE"
 P=$E/bin/python
+"$P" - <<'PY'
+import sys
+
+if not (sys.version_info[:2] >= (3, 10) and sys.version_info[:2] <= (3, 12)):
+    raise SystemExit(f"Python 3.10-3.12 is required; cloned {sys.version.split()[0]}")
+PY
 
 echo "installing Torch/vLLM from Aliyun PyPI"
 "$P" -m pip --isolated install -i "$M" -U pip setuptools wheel
