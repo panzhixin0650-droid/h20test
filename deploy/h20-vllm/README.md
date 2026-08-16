@@ -72,6 +72,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 RUN_INSTALL=1 \
 The environment is installed with `uv` under
 `/mnt/tidalfs-alwl01/task/236362/GQLA/envs/venv-py312`. Re-running the command
 reuses the environment, wheel cache, source tree, and compiled HPC wheel.
+When a copied CUDA 13 Torch environment meets an H20 DLC host driver that still
+reports CUDA 12.x, bootstrap downloads the SHA256-pinned 62 MiB NVIDIA
+`cuda-compat-13-0` package and extracts it below `GQLA/envs`. The host driver is
+not modified, and the already-installed Torch/vLLM and compiled HPC wheel are
+reused.
 
 ## Benchmark after install
 

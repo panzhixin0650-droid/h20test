@@ -55,7 +55,7 @@ scripts/bootstrap_dsv3p1_g8_h20_env.sh
 1. 只校验现有模型的 `model.safetensors.index.json` 及其全部 shard；**不会下载、复制或改写模型权重**。
 2. 把 Python 3.12 环境装到 `/mnt/tidalfs-alwl01/task/236362/GQLA/envs/venv-py312`。
 3. 使用 Rust 实现的 `uv` 并发下载大 wheel，而不是串行使用 pip；下载缓存固定保存在 `/mnt/tidalfs-alwl01/task/236362/GQLA/.cache/uv`，任务重启后可复用。
-4. 安装已验证的 `torch==2.11.0`、`vllm==0.22.1`、`transformers==5.12.1` 和 CMake/Ninja；不安装测速不需要的 `lm_eval`、`datasets`。
+4. 安装已验证的 `torch==2.11.0`、`vllm==0.22.1`、`transformers==5.12.1` 和 CMake/Ninja；不安装测速不需要的 `lm_eval`、`datasets`。若 CUDA 13 Torch 遇到 CUDA 12.x 宿主驱动，脚本会从 NVIDIA 官方仓库下载并校验约 62 MiB 的 `cuda-compat-13-0` 用户态兼容库，解压到 `envs`，不会改宿主机驱动。
 5. 以 editable 方式安装当前 GQLA plugin，确保 vLLM worker 不会指向另一台机器上的旧源码路径。
 6. 当 `PATHS` 包含 `gqa-hpc` 时，使用目标环境自己的 Torch/CUDA ABI 在 H20 上编译并安装 HPC-Ops；源码或 ABI 没变时后续运行直接跳过。
 7. 检查 8 张可见 GPU、CUDA 初始化、SM90 capability、vLLM architecture 注册以及 HPC `softmax_scale` schema。
@@ -85,6 +85,11 @@ INSTALL_ONLY=1 bash scripts/benchmark_dsv3p1_g8_h20_tp8.sh
 ```
 
 环境已准备好后可用 `BOOTSTRAP_ENV=0` 跳过 bootstrap；正常情况下保持默认更安全，因为快速检查会自动复用已有安装。需要重编 HPC-Ops 时设置 `FORCE_HPC_REBUILD=1`，需要重新解析并安装核心 wheel 时设置 `FORCE_CORE_REINSTALL=1`。
+
+如果日志出现 `driver ... too old (found version 12040)`，说明复制来的环境是 CUDA 13
+Torch，而宿主机驱动仍属于 CUDA 12.x。更新脚本后重新执行安装检查即可；bootstrap 会
+自动配置 NVIDIA forward-compat 库并复用已经装好的 Torch/vLLM 和已经编译成功的
+HPC-Ops，不需要重下数 GiB wheel，也不需要升级宿主机内核驱动。
 
 ## 运行
 

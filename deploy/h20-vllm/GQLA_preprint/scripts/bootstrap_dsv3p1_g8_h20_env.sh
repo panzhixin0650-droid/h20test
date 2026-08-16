@@ -26,6 +26,11 @@ UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR:-$ENV_ROOT/python}
 UV_VERSION=${UV_VERSION:-0.9.3}
 PYTHON_VERSION=${PYTHON_VERSION:-3.12.12}
 REQUIREMENTS_FILE=${REQUIREMENTS_FILE:-$REPO_DIR/requirements-h20-vllm.txt}
+CUDA_COMPAT_MODE=${CUDA_COMPAT_MODE:-auto}
+CUDA_COMPAT_VERSION=${CUDA_COMPAT_VERSION:-13-0}
+CUDA_COMPAT_PACKAGE_VERSION=${CUDA_COMPAT_PACKAGE_VERSION:-580.178.04-1ubuntu1}
+CUDA_COMPAT_PACKAGE_SHA256=${CUDA_COMPAT_PACKAGE_SHA256:-14a3d14373f882297f368d6282fc7fba85e46682f34166291d61df1913a59c8f}
+CUDA_COMPAT_PACKAGE_URL=${CUDA_COMPAT_PACKAGE_URL:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-compat-13-0_580.178.04-1ubuntu1_amd64.deb}
 if [[ -z "${HPC_OPS_DIR:-}" ]]; then
     if [[ -d "$REPO_DIR/../hpc-ops" ]]; then
         HPC_OPS_DIR=$(cd "$REPO_DIR/../hpc-ops" && pwd -P)
@@ -104,6 +109,105 @@ build_tools_are_ready() {
     [[ -x "$VENV_DIR/bin/cmake" && -x "$VENV_DIR/bin/ninja" ]] || return 1
     "$VENV_DIR/bin/cmake" --version >/dev/null 2>&1 || return 1
     "$VENV_DIR/bin/ninja" --version >/dev/null 2>&1 || return 1
+}
+
+configure_cuda_forward_compat() {
+    local torch_cuda torch_cuda_major driver_version driver_major
+    local archive partial install_root lib_dir extract_root actual_sha
+
+    CUDA_COMPAT_LIB_DIR=
+    torch_cuda=$("$PYTHON" -c 'import torch; print(torch.version.cuda or "")')
+    torch_cuda_major=${torch_cuda%%.*}
+    if [[ -z "$torch_cuda_major" || ! "$torch_cuda_major" =~ ^[0-9]+$ ]]; then
+        die "cannot determine the CUDA version embedded in Torch: $torch_cuda"
+    fi
+
+    command -v nvidia-smi >/dev/null 2>&1 \
+        || die "nvidia-smi is required to validate the host driver"
+    driver_version=$(nvidia-smi --query-gpu=driver_version \
+        --format=csv,noheader 2>/dev/null \
+        | sed -n '1{s/[[:space:]]//g;p;}')
+    driver_major=${driver_version%%.*}
+    [[ "$driver_major" =~ ^[0-9]+$ ]] \
+        || die "cannot determine the NVIDIA driver version from nvidia-smi: $driver_version"
+
+    echo "[bootstrap] Torch CUDA=$torch_cuda host_driver=$driver_version"
+    if (( torch_cuda_major < 13 || driver_major >= 580 )); then
+        return 0
+    fi
+    if [[ "$CUDA_COMPAT_MODE" == off ]]; then
+        echo "[bootstrap] CUDA forward compatibility disabled by CUDA_COMPAT_MODE=off"
+        return 0
+    fi
+    (( driver_major >= 525 )) \
+        || die "CUDA 13 forward compatibility requires an R525-or-newer data-center driver; found $driver_version"
+    [[ "$(uname -m)" == x86_64 ]] \
+        || die "the pinned CUDA compatibility package currently supports x86_64 only"
+    command -v dpkg-deb >/dev/null 2>&1 \
+        || die "dpkg-deb is required to unpack the CUDA compatibility package"
+
+    archive=$ENV_ROOT/downloads/cuda-compat-${CUDA_COMPAT_VERSION}_${CUDA_COMPAT_PACKAGE_VERSION}_amd64.deb
+    partial=$archive.part
+    install_root=$ENV_ROOT/cuda-compat-${CUDA_COMPAT_VERSION}-${CUDA_COMPAT_PACKAGE_VERSION}
+    lib_dir=$install_root/usr/local/cuda-13.0/compat
+    mkdir -p "$ENV_ROOT/downloads"
+
+    if [[ ! -f "$lib_dir/libcuda.so.1" ]]; then
+        if [[ -f "$archive" ]]; then
+            actual_sha=$(sha256sum "$archive" | awk '{print $1}')
+            if [[ "$actual_sha" != "$CUDA_COMPAT_PACKAGE_SHA256" ]]; then
+                mv "$archive" "$archive.bad.$(date -u +%Y%m%dT%H%M%SZ)"
+            fi
+        fi
+        if [[ ! -f "$archive" ]]; then
+            echo "[bootstrap] downloading NVIDIA CUDA forward-compat package (about 62 MiB)"
+            if command -v aria2c >/dev/null 2>&1; then
+                aria2c --allow-overwrite=true --auto-file-renaming=false \
+                    --continue=true --max-connection-per-server=16 --split=16 \
+                    --min-split-size=1M --dir="$(dirname "$partial")" \
+                    --out="$(basename "$partial")" "$CUDA_COMPAT_PACKAGE_URL"
+            else
+                curl --fail --location --retry 8 --retry-delay 2 \
+                    --connect-timeout 30 --continue-at - \
+                    --output "$partial" "$CUDA_COMPAT_PACKAGE_URL"
+            fi
+            mv -f -- "$partial" "$archive"
+        fi
+        actual_sha=$(sha256sum "$archive" | awk '{print $1}')
+        [[ "$actual_sha" == "$CUDA_COMPAT_PACKAGE_SHA256" ]] \
+            || die "CUDA compatibility package SHA256 mismatch: $actual_sha"
+
+        extract_root=$(mktemp -d "$ENV_ROOT/.cuda-compat-extract.XXXXXX")
+        dpkg-deb -x "$archive" "$extract_root"
+        [[ -f "$extract_root/usr/local/cuda-13.0/compat/libcuda.so.1" ]] \
+            || die "CUDA compatibility package did not contain libcuda.so.1"
+        if [[ -e "$install_root" ]]; then
+            mv "$install_root" "$install_root.previous.$(date -u +%Y%m%dT%H%M%SZ)"
+        fi
+        mv "$extract_root" "$install_root"
+    fi
+
+    CUDA_COMPAT_LIB_DIR=$lib_dir
+    export LD_LIBRARY_PATH="$CUDA_COMPAT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "[bootstrap] enabled CUDA forward compatibility: $CUDA_COMPAT_LIB_DIR"
+
+    if ! "$PYTHON" - <<'PY'
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit(1)
+torch.empty(1, device="cuda:0")
+torch.cuda.synchronize()
+print(
+    "CUDA_FORWARD_COMPAT_OK",
+    f"torch={torch.__version__}",
+    f"cuda={torch.version.cuda}",
+    f"gpu={torch.cuda.get_device_name(0)}",
+)
+PY
+    then
+        die "CUDA 13 forward compatibility did not initialize the GPU; use a DLC image with an R580+ driver or reinstall the CUDA 12.9 Torch/vLLM variant"
+    fi
 }
 
 find_cuda_toolkit() {
@@ -186,9 +290,16 @@ PY
 }
 
 write_runtime_env() {
-    local torch_lib torch_cmake_prefix
+    local torch_lib torch_cmake_prefix runtime_ld_prefix
     torch_lib=$("$PYTHON" -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "lib")')
     torch_cmake_prefix=$("$PYTHON" -c 'import torch; print(torch.utils.cmake_prefix_path)')
+    runtime_ld_prefix=$torch_lib
+    if [[ -n "${CUDA_TOOLKIT_ROOT:-}" ]]; then
+        runtime_ld_prefix=$CUDA_TOOLKIT_ROOT/lib:$runtime_ld_prefix
+    fi
+    if [[ -n "${CUDA_COMPAT_LIB_DIR:-}" ]]; then
+        runtime_ld_prefix=$CUDA_COMPAT_LIB_DIR:$runtime_ld_prefix
+    fi
     mkdir -p "$(dirname "$RUNTIME_ENV_FILE")"
     {
         printf 'export GQLA_ROOT=%q\n' "$GQLA_ROOT"
@@ -203,9 +314,9 @@ write_runtime_env() {
             printf 'export CUDAToolkit_ROOT=%q\n' "$CUDA_TOOLKIT_ROOT"
             printf 'export CUDACXX=%q\n' "$CUDA_TOOLKIT_ROOT/bin/nvcc"
             printf 'export PATH=%q:$PATH\n' "$CUDA_TOOLKIT_ROOT/bin"
-            printf 'export LD_LIBRARY_PATH=%q:%q${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' \
-                "$CUDA_TOOLKIT_ROOT/lib" "$torch_lib"
         fi
+        printf 'export LD_LIBRARY_PATH=%q${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' \
+            "$runtime_ld_prefix"
         printf 'export CMAKE_PREFIX_PATH=%q${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}\n' \
             "$torch_cmake_prefix"
         printf 'export CMAKE_GENERATOR=Ninja\n'
@@ -215,6 +326,10 @@ write_runtime_env() {
 require_bool NEEDS_HPC "$NEEDS_HPC"
 require_bool FORCE_CORE_REINSTALL "$FORCE_CORE_REINSTALL"
 require_bool FORCE_HPC_REBUILD "$FORCE_HPC_REBUILD"
+case "$CUDA_COMPAT_MODE" in
+    auto|off) ;;
+    *) die "CUDA_COMPAT_MODE must be auto or off; got $CUDA_COMPAT_MODE" ;;
+esac
 
 for command_name in bash curl tar sha256sum sort awk sed find xargs install; do
     command -v "$command_name" >/dev/null 2>&1 \
@@ -292,6 +407,8 @@ if [[ "$FORCE_CORE_REINSTALL" == 1 ]] || ! core_stack_is_ready; then
 else
     echo "[bootstrap] pinned torch/vLLM/transformers stack already present"
 fi
+
+configure_cuda_forward_compat
 
 if ! build_tools_are_ready; then
     echo "[bootstrap] installing/repairing CMake, Ninja, setuptools, and wheel"
@@ -438,6 +555,8 @@ fi
     printf 'uv=%q\n' "$UV_BIN"
     printf 'uv_cache_dir=%q\n' "$UV_CACHE_DIR"
     printf 'needs_hpc=%q\n' "$NEEDS_HPC"
+    printf 'cuda_compat_mode=%q\n' "$CUDA_COMPAT_MODE"
+    printf 'cuda_compat_lib_dir=%q\n' "${CUDA_COMPAT_LIB_DIR:-not-required}"
     printf 'cuda_toolkit_root=%q\n' "${CUDA_TOOLKIT_ROOT:-not-required}"
     printf 'cuda_toolkit_version=%q\n' "${CUDA_TOOLKIT_VERSION:-not-required}"
 } >"$VENV_DIR/h20-bootstrap-manifest.env"

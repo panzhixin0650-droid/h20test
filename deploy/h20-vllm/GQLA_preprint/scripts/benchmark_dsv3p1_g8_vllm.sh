@@ -699,7 +699,9 @@ export TRANSFORMERS_OFFLINE=1
 export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 vllm_version=$("$PYTHON" -c \
     'from importlib.metadata import version; print(version("vllm"))')
-if [[ "$vllm_version" != "$EXPECTED_VLLM_VERSION" ]]; then
+vllm_base_version=$("$PYTHON" -c \
+    'from importlib.metadata import version; from packaging.version import Version; print(Version(version("vllm")).base_version)')
+if [[ "$vllm_base_version" != "$EXPECTED_VLLM_VERSION" ]]; then
     die "expected vLLM $EXPECTED_VLLM_VERSION, found $vllm_version"
 fi
 
