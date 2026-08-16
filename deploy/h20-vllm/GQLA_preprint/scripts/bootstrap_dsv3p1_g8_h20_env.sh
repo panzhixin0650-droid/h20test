@@ -9,7 +9,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd -P)
-DEFAULT_GQLA_ROOT=/mnt/tidalfs-alwl01/task/236362/GQLA
+DEFAULT_GQLA_ROOT=$(cd "$REPO_DIR/../.." && pwd -P)
 DEFAULT_MODEL_DIR=$DEFAULT_GQLA_ROOT/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract
 
 MODEL_DIR=${MODEL_DIR:-$DEFAULT_MODEL_DIR}

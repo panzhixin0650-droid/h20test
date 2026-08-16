@@ -7,7 +7,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd -P)
-DEFAULT_GQLA_ROOT=/mnt/tidalfs-alwl01/task/236362/GQLA
+DEFAULT_GQLA_ROOT=$(cd "$REPO_DIR/../.." && pwd -P)
 DEFAULT_MODEL_DIR=$DEFAULT_GQLA_ROOT/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract
 MODEL_DIR=${MODEL_DIR:-$DEFAULT_MODEL_DIR}
 if [[ -z "${GQLA_ROOT:-}" ]]; then
@@ -125,8 +125,11 @@ if [[ "$CPU_OFFLOAD_GB" != 0 && "$CPU_OFFLOAD_GB" != 0.0 ]]; then
     die "formal H20 benchmark fixes CPU_OFFLOAD_GB=0; got $CPU_OFFLOAD_GB"
 fi
 [[ -f "$BASE_SCRIPT" ]] || die "base benchmark is missing: $BASE_SCRIPT"
-MODEL_DIR=$(readlink -f -- "$MODEL_DIR") \
-    || die "converted model directory does not exist: $MODEL_DIR"
+requested_model_dir=$MODEL_DIR
+MODEL_DIR=$(readlink -f -- "$requested_model_dir") \
+    || die "converted model directory does not exist: $requested_model_dir"
+[[ -d "$MODEL_DIR" ]] \
+    || die "converted model directory does not exist: $requested_model_dir"
 for required in config.json model.safetensors.index.json tokenizer.json tokenizer_config.json; do
     [[ -f "$MODEL_DIR/$required" ]] \
         || die "missing converted-model file: $MODEL_DIR/$required"
