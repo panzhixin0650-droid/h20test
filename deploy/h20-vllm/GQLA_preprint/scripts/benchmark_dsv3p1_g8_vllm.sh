@@ -63,6 +63,9 @@ readonly BLOCK_SIZE=64
 HPC_HIT_PATTERN=${HPC_HIT_PATTERN:-GQLA_HPC_TRACE_HIT}
 HPC_FALLBACK_PATTERN=${HPC_FALLBACK_PATTERN:-GQLA_HPC_TRACE_FALLBACK}
 HPC_SCALE_PATTERN=${HPC_SCALE_PATTERN:-softmax_scale=0\.135233}
+HPC_ALL_DECODE_PATTERN=${HPC_ALL_DECODE_PATTERN:-GQLA_HPC_ALL_DECODE_STRICT_ENABLED}
+HPC_MIXED_SPLIT_PATTERN=${HPC_MIXED_SPLIT_PATTERN:-GQLA_HPC_TRACE_MIXED_SPLIT}
+REQUIRE_HPC_MIXED_SPLIT=${REQUIRE_HPC_MIXED_SPLIT:-$ENABLE_CHUNKED_PREFILL}
 
 SERVER_PID=
 SERVER_PGID=
@@ -322,6 +325,8 @@ verify_trace() {
     local architecture_hits
     local topology_hits
     local mla_backend_hits
+    local all_decode_hits
+    local mixed_split_hits
     hits=$(grep -Ec -- "$HPC_HIT_PATTERN" "$SERVER_LOG" || true)
     fallbacks=$(grep -Ec -- "$HPC_FALLBACK_PATTERN" "$SERVER_LOG" || true)
     scale_hits=$(grep -Ec -- "$HPC_SCALE_PATTERN" "$SERVER_LOG" || true)
@@ -331,6 +336,8 @@ verify_trace() {
         "$SERVER_LOG" || true)
     mla_backend_hits=$(grep -Ec -- "Using FLASH_ATTN_MLA attention backend" \
         "$SERVER_LOG" || true)
+    all_decode_hits=$(grep -Ec -- "$HPC_ALL_DECODE_PATTERN" "$SERVER_LOG" || true)
+    mixed_split_hits=$(grep -Ec -- "$HPC_MIXED_SPLIT_PATTERN" "$SERVER_LOG" || true)
 
     if (( architecture_hits == 0 )); then
         die "server log does not prove architecture $architecture: $SERVER_LOG"
@@ -346,19 +353,29 @@ verify_trace() {
         if (( hits == 0 )); then
             die "GQA run completed without an HPC hit marker: $SERVER_LOG"
         fi
+        if (( all_decode_hits == 0 )); then
+            die "GQA run did not enable the all-decode HPC strict contract: $SERVER_LOG"
+        fi
+        if (( REQUIRE_HPC_MIXED_SPLIT == 1 && mixed_split_hits == 0 )); then
+            die "GQA run did not prove mixed-batch decode splitting: $SERVER_LOG"
+        fi
         if (( scale_hits == 0 )); then
             die "GQA run completed without the production YaRN scale marker: $SERVER_LOG"
         fi
-        printf 'route=gqa-hpc\ntp=%s\npp=%s\narchitecture=%s\narchitecture_hits=%s\ntopology_hits=%s\nhpc_hits=%s\nhpc_fallbacks=%s\nsoftmax_scale_hits=%s\nstatus=verified\n' \
+        printf 'route=gqa-hpc\ntp=%s\npp=%s\narchitecture=%s\narchitecture_hits=%s\ntopology_hits=%s\nhpc_hits=%s\nhpc_fallbacks=%s\nall_decode_strict_hits=%s\nmixed_split_hits=%s\nrequire_mixed_split=%s\nsoftmax_scale_hits=%s\nstatus=verified_all_decode_hpc\n' \
             "$tp" "$PIPELINE_PARALLEL_SIZE" "$architecture" \
             "$architecture_hits" "$topology_hits" "$hits" "$fallbacks" \
-            "$scale_hits" >"$proof_file"
+            "$all_decode_hits" "$mixed_split_hits" \
+            "$REQUIRE_HPC_MIXED_SPLIT" "$scale_hits" >"$proof_file"
     else
         if (( hits != 0 )); then
             die "MQA/MLA control unexpectedly emitted $hits HPC hit marker(s): $SERVER_LOG"
         fi
         if (( mla_backend_hits == 0 )); then
             die "MQA/MLA run did not select FLASH_ATTN_MLA: $SERVER_LOG"
+        fi
+        if (( all_decode_hits != 0 || mixed_split_hits != 0 )); then
+            die "MQA/MLA control unexpectedly enabled the GQLA HPC split backend: $SERVER_LOG"
         fi
         printf 'route=mqa-mla\ntp=%s\npp=%s\narchitecture=%s\narchitecture_hits=%s\ntopology_hits=%s\nflash_attn_mla_hits=%s\nhpc_hits=%s\nstatus=verified_mla\n' \
             "$tp" "$PIPELINE_PARALLEL_SIZE" "$architecture" \
@@ -621,6 +638,7 @@ run_case() {
 
 require_bool ENFORCE_EAGER "$ENFORCE_EAGER"
 require_bool ENABLE_CHUNKED_PREFILL "$ENABLE_CHUNKED_PREFILL"
+require_bool REQUIRE_HPC_MIXED_SPLIT "$REQUIRE_HPC_MIXED_SPLIT"
 require_bool DRY_RUN "$DRY_RUN"
 require_nonnegative_number CPU_OFFLOAD_GB "$CPU_OFFLOAD_GB"
 for pair in \
@@ -862,6 +880,7 @@ PY
         printf 'cpu_offload_gb=%q\n' "$CPU_OFFLOAD_GB"
         printf 'enforce_eager=%q\n' "$ENFORCE_EAGER"
         printf 'enable_chunked_prefill=%q\n' "$ENABLE_CHUNKED_PREFILL"
+        printf 'require_hpc_mixed_split=%q\n' "$REQUIRE_HPC_MIXED_SPLIT"
         printf 'vllm_execute_model_timeout_seconds=%q\n' \
             "$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
     } >"$RUN_DIR/manifest.env"

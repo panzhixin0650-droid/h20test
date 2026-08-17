@@ -20,14 +20,21 @@ PROMPT_TOKENS=${PROMPT_TOKENS:-16}
 DECODE_TOKENS=${DECODE_TOKENS:-4}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-64}
 VERIFY_HPC_TRACE=${VERIFY_HPC_TRACE:-1}
+VERIFY_HPC_MIXED_SPLIT=${VERIFY_HPC_MIXED_SPLIT:-1}
 HPC_HIT_PATTERN=${HPC_HIT_PATTERN:-GQLA_HPC_TRACE_HIT}
 HPC_FALLBACK_PATTERN=${HPC_FALLBACK_PATTERN:-GQLA_HPC_TRACE_FALLBACK}
 HPC_SCALE_PATTERN=${HPC_SCALE_PATTERN:-softmax_scale=0\\.135233}
+HPC_ALL_DECODE_PATTERN=${HPC_ALL_DECODE_PATTERN:-GQLA_HPC_ALL_DECODE_STRICT_ENABLED}
+HPC_MIXED_SPLIT_PATTERN=${HPC_MIXED_SPLIT_PATTERN:-GQLA_HPC_TRACE_MIXED_SPLIT}
 
-case "$VERIFY_HPC_TRACE" in
-    0|1) ;;
-    *) echo "VERIFY_HPC_TRACE must be 0 or 1" >&2; exit 2 ;;
-esac
+for pair in \
+    "VERIFY_HPC_TRACE:$VERIFY_HPC_TRACE" \
+    "VERIFY_HPC_MIXED_SPLIT:$VERIFY_HPC_MIXED_SPLIT"; do
+    case "${pair#*:}" in
+        0|1) ;;
+        *) echo "${pair%%:*} must be 0 or 1" >&2; exit 2 ;;
+    esac
+done
 
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
@@ -95,6 +102,9 @@ for path in "${path_values[@]}"; do
             --max-model-len "$MAX_MODEL_LEN"
             --result-json "$result"
         )
+        if [[ "$VERIFY_HPC_MIXED_SPLIT" == 1 ]]; then
+            args+=(--mixed-batch)
+        fi
 
         echo "[smoke] start path=$path tp=$tp log=$log"
         set +e
@@ -114,6 +124,15 @@ for path in "${path_values[@]}"; do
             fi
             if ! grep -Eq -- "$HPC_HIT_PATTERN" "$log"; then
                 echo "HPC hit proof missing for path=$path tp=$tp; log=$log" >&2
+                exit 1
+            fi
+            if ! grep -Eq -- "$HPC_ALL_DECODE_PATTERN" "$log"; then
+                echo "all-decode HPC strict proof missing for path=$path tp=$tp; log=$log" >&2
+                exit 1
+            fi
+            if [[ "$VERIFY_HPC_MIXED_SPLIT" == 1 ]] \
+                && ! grep -Eq -- "$HPC_MIXED_SPLIT_PATTERN" "$log"; then
+                echo "mixed-batch HPC split proof missing for path=$path tp=$tp; log=$log" >&2
                 exit 1
             fi
             if ! grep -Eq -- "$HPC_SCALE_PATTERN" "$log"; then

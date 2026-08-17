@@ -113,6 +113,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--mixed-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "submit short and long prompts with chunked prefill so a scheduler "
+            "step contains both decode and prefill tokens"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -122,7 +131,8 @@ def main() -> None:
     config, geometry = validate_fixture(model_dir)
     if args.prompt_tokens < 2 or args.decode_tokens < 1:
         raise ValueError("prompt-tokens must be >=2 and decode-tokens must be >=1")
-    if args.prompt_tokens + args.decode_tokens > args.max_model_len:
+    longest_prompt_tokens = args.prompt_tokens * (3 if args.mixed_batch else 1)
+    if longest_prompt_tokens + args.decode_tokens > args.max_model_len:
         raise ValueError("prompt + decode tokens exceed max-model-len")
     if 128 % args.tp or 8 % args.tp:
         raise ValueError(f"TP={args.tp} must divide both H=128 and G=8")
@@ -146,6 +156,7 @@ def main() -> None:
         "load_format": "dummy",
         "strict_hpc": strict_hpc,
         "trace_hpc": trace_hpc,
+        "mixed_batch": args.mixed_batch,
         "geometry": geometry,
     }
     print("DSV3P1_G8_VLLM_SMOKE_BEGIN " + json.dumps(start_record, sort_keys=True), flush=True)
@@ -165,32 +176,46 @@ def main() -> None:
 
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     init_start = time.perf_counter()
-    llm = LLM(
-        model=str(model_dir),
-        skip_tokenizer_init=True,
-        trust_remote_code=False,
-        tensor_parallel_size=args.tp,
-        dtype=args.dtype,
-        seed=args.seed,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=args.enforce_eager,
-        disable_custom_all_reduce=args.tp == 2,
-        hf_overrides={"architectures": [architecture]},
-        load_format="dummy",
-        max_model_len=args.max_model_len,
+    llm_kwargs: dict[str, Any] = {
+        "model": str(model_dir),
+        "skip_tokenizer_init": True,
+        "trust_remote_code": False,
+        "tensor_parallel_size": args.tp,
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "enforce_eager": args.enforce_eager,
+        "disable_custom_all_reduce": args.tp == 2,
+        "hf_overrides": {"architectures": [architecture]},
+        "load_format": "dummy",
+        "max_model_len": args.max_model_len,
         # HPC-Ops GQA consumes 64-token cache pages.  Pin the control to the
         # same page size so cache allocator geometry is not a confounder.
-        block_size=64,
-        enable_prefix_caching=False,
-        enable_chunked_prefill=False,
-        disable_log_stats=True,
-        max_num_seqs=4,
+        "block_size": 64,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": args.mixed_batch,
+        "disable_log_stats": True,
+        "max_num_seqs": 4,
+    }
+    if args.mixed_batch:
+        # With default 16/48-token prompts and a 32-token scheduler budget,
+        # the short request starts decode while the long request is still in
+        # chunked prefill.  That is the regression case for all-decode HPC.
+        llm_kwargs["max_num_batched_tokens"] = args.prompt_tokens * 2
+    llm = LLM(
+        **llm_kwargs,
     )
     init_seconds = time.perf_counter() - init_start
 
     vocab_size = int(config["vocab_size"])
-    token_ids = [2 + (index % (vocab_size - 2)) for index in range(args.prompt_tokens)]
-    prompt = TokensPrompt(prompt_token_ids=token_ids)
+    prompt_lengths = [args.prompt_tokens]
+    if args.mixed_batch:
+        prompt_lengths.append(longest_prompt_tokens)
+    prompt_token_ids = [
+        [2 + (index % (vocab_size - 2)) for index in range(prompt_length)]
+        for prompt_length in prompt_lengths
+    ]
+    prompts = [TokensPrompt(prompt_token_ids=token_ids) for token_ids in prompt_token_ids]
     sampling = SamplingParams(
         temperature=0.0,
         min_tokens=args.decode_tokens,
@@ -199,23 +224,25 @@ def main() -> None:
         seed=args.seed,
     )
     run_start = time.perf_counter()
-    requests = llm.generate([prompt], sampling, use_tqdm=False)
+    requests = llm.generate(prompts, sampling, use_tqdm=False)
     run_seconds = time.perf_counter() - run_start
-    if len(requests) != 1 or len(requests[0].outputs) != 1:
-        raise RuntimeError("vLLM did not return exactly one completion")
-    generated_ids = list(requests[0].outputs[0].token_ids)
-    if len(generated_ids) != args.decode_tokens:
+    if len(requests) != len(prompts) or any(len(request.outputs) != 1 for request in requests):
+        raise RuntimeError(f"vLLM did not return exactly {len(prompts)} completions")
+    generated_token_ids = [list(request.outputs[0].token_ids) for request in requests]
+    if any(len(token_ids) != args.decode_tokens for token_ids in generated_token_ids):
         raise RuntimeError(
-            f"decode length mismatch: got {len(generated_ids)}, expected {args.decode_tokens}"
+            "decode length mismatch: "
+            f"got {[len(token_ids) for token_ids in generated_token_ids]}, "
+            f"expected {args.decode_tokens} each"
         )
 
     result = {
         **start_record,
         "model_dir": str(model_dir),
         "visible_devices": visible_devices,
-        "prompt_tokens": len(token_ids),
-        "decode_tokens": len(generated_ids),
-        "generated_token_ids": generated_ids,
+        "prompt_tokens": [len(token_ids) for token_ids in prompt_token_ids],
+        "decode_tokens": [len(token_ids) for token_ids in generated_token_ids],
+        "generated_token_ids": generated_token_ids,
         "init_seconds": init_seconds,
         "prefill_decode_seconds": run_seconds,
         "hpc_proof": (

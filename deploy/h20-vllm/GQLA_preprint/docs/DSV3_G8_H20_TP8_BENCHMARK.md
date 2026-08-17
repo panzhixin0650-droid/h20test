@@ -30,7 +30,7 @@ scripts/benchmark_dsv3p1_g8_gqla_h20_tp8_16k.sh
 | case | architecture | attention / KV 路径 | 有效性条件 |
 |---|---|---|---|
 | `mqa-mla-tp8` | `DeepseekV3GQLAForCausalLM` | vLLM `FLASH_ATTN_MLA`、latent MQA cache | 日志必须证明选择 `FLASH_ATTN_MLA`，且没有 HPC HIT |
-| `gqa-hpc-tp8` | `DeepseekV3GQLAHPCForCausalLM` | 真实 GQLA cache；decode 调用 HPC-Ops，prefill 使用 DiffKV | strict 模式下必须出现 HPC HIT 和 `softmax_scale=0.135233...`，且不得出现 eligible-decode fallback |
+| `gqa-hpc-tp8` | `DeepseekV3GQLAHPCForCausalLM` | 真实 GQLA cache；所有 decode 调用 HPC-Ops；纯 prefill 使用 DiffKV，混合 batch 只将 prefill 后缀交给 DiffKV | 必须出现 all-decode strict、HPC HIT、mixed-split 和 `softmax_scale=0.135233...`，且不得出现 fallback |
 
 两个 case 都固定 `TP=8`、`PP=1`、KV block size 64，并加载：
 
@@ -200,6 +200,8 @@ bash scripts/benchmark_dsv3p1_g8_h20_tp8.sh
         └── ...
 ```
 
-只有两个 `verification.txt` 分别通过 MLA backend 和 GQLA/HPC trace 校验，并且最终
+GQLA 的 `verification.txt` 必须写出 `status=verified_all_decode_hpc`，不能再用旧版的
+“至少一次 HIT”作为完整路由证据。只有两个 `verification.txt` 分别通过 MLA backend
+和 GQLA/HPC all-decode trace 校验，并且最终
 打印 `DSV3P1_G8_VLLM_BENCHMARK_MATRIX_OK`，这一组结果才算完整有效。启动和 checkpoint
 加载时间不计入 `bench serve` 的吞吐与请求延迟指标。
