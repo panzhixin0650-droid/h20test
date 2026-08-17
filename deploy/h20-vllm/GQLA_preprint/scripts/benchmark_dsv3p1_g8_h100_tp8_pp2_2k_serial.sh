@@ -16,6 +16,7 @@ GQLA_RUN_ID=${GQLA_RUN_ID:-${SERIES_ID}-gqla}
 MLA_OUTPUT_ROOT=${MLA_OUTPUT_ROOT:-$GQLA_ROOT/outputs/benchmarks/dsv3p1_g8_mla_h100_tp8_pp2_2k}
 GQLA_OUTPUT_ROOT=${GQLA_OUTPUT_ROOT:-$GQLA_ROOT/outputs/benchmarks/dsv3p1_g8_gqla_h100_tp8_pp2_2k}
 SERIAL_COOLDOWN_SECONDS=${SERIAL_COOLDOWN_SECONDS:-30}
+RUN_MIXED_SMOKE=${RUN_MIXED_SMOKE:-1}
 DRY_RUN=${DRY_RUN:-0}
 CHILD_PID=
 
@@ -72,6 +73,28 @@ run_route() {
     echo "[serial] completed route=$label run_id=$run_id"
 }
 
+run_mixed_smoke() {
+    local node_rank=${MACHINE_RANK:-${NODE_RANK:-${RANK:-}}}
+    local visible_device=${SMOKE_VISIBLE_DEVICE:-${CUDA_VISIBLE_DEVICES:-}}
+    local smoke_root=$GQLA_ROOT/outputs/smoke/h100-all-decode/$SERIES_ID
+
+    [[ "$node_rank" =~ ^[01]$ ]] \
+        || die "mixed smoke needs DLC node rank 0 or 1; got ${node_rank:-unset}"
+    visible_device=${visible_device%%,*}
+    visible_device=${visible_device:-0}
+
+    echo "[serial] mixed smoke node=$node_rank device=$visible_device"
+    CUDA_VISIBLE_DEVICES="$visible_device" \
+    PYTHON=${PYTHON:-$GQLA_ROOT/envs/venv-py312/bin/python} \
+    TPS=1 \
+    SMOKE_PATHS=gqa-hpc \
+    VERIFY_HPC_TRACE=1 \
+    VERIFY_HPC_MIXED_SPLIT=1 \
+    LOG_ROOT="$smoke_root/node-$node_rank" \
+    bash "$SCRIPT_DIR/run_dsv3p1_g8_vllm_smoke.sh"
+    echo "[serial] mixed smoke passed node=$node_rank"
+}
+
 for path in "$MLA_SCRIPT" "$GQLA_SCRIPT"; do
     [[ -f "$path" ]] || die "missing child benchmark entrypoint: $path"
 done
@@ -87,11 +110,18 @@ case "$DRY_RUN" in
     0|1) ;;
     *) die "DRY_RUN must be 0 or 1; got $DRY_RUN" ;;
 esac
+case "$RUN_MIXED_SMOKE" in
+    0|1) ;;
+    *) die "RUN_MIXED_SMOKE must be 0 or 1; got $RUN_MIXED_SMOKE" ;;
+esac
 
 trap on_exit EXIT
 trap on_signal INT TERM
 
 echo "[serial] series=$SERIES_ID order=MLA,GQLA cooldown=${SERIAL_COOLDOWN_SECONDS}s"
+if [[ "$DRY_RUN" == 0 && "$RUN_MIXED_SMOKE" == 1 ]]; then
+    run_mixed_smoke
+fi
 run_route MLA "$MLA_SCRIPT" "$MLA_RUN_ID" "$MLA_OUTPUT_ROOT"
 if [[ "$DRY_RUN" == 0 ]] && (( SERIAL_COOLDOWN_SECONDS > 0 )); then
     echo "[serial] cooling down ${SERIAL_COOLDOWN_SECONDS}s before GQLA"

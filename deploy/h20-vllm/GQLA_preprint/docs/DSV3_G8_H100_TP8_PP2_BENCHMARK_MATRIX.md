@@ -42,6 +42,10 @@ bash scripts/benchmark_dsv3p1_g8_h100_tp8_pp2_2k_serial.sh
 
 两条结果基名分别为 `${SERIES_ID}-mla` 和 `${SERIES_ID}-gqla`。这一入口保持相同
 16 卡拓扑和服务协议，适合替换此前只验证“至少一次 HPC HIT”的旧 H100 2K 数据。
+加载 660+ GiB 正式权重前，两个 worker 会各自在本机 GPU 0 上运行一个 tiny dummy
+mixed-batch smoke，分别确认 all-decode、mixed-split、HPC HIT 且零 fallback；随后较早
+完成的节点会在分布式 rendezvous 中等待另一节点。诊断时可用 `RUN_MIXED_SMOKE=0`
+跳过，但这种运行不应作为新路由首次验收。
 
 当前 MLA 2K：
 
