@@ -23,7 +23,7 @@ registrations, and the rebuilt patched HPC-Ops ABI have passed bootstrap:
 H20_ALIYUN_SETUP_OK
 ```
 
-## Recommended: clean cu129 environment plus one-case benchmark
+## Optional: clean cu129 environment plus one-case benchmark
 
 The current H20 DLC host exposes a CUDA 12.x driver. The two scripts below do
 not reuse a copied virtual environment and do not require the CUDA 13 forward
@@ -161,10 +161,27 @@ stack, transfer the environment or wheel bundle through a verified OSS prefix;
 do not put Python, uv, CUDA wheels, or a venv in this Git branch.
 
 For a split-K source refresh on a machine that already ran vLLM, use the
-HPC-only updater. It auto-selects an existing environment only when it exactly
-matches Torch 2.11/cu129, vLLM 0.22.1, and Transformers 5.12.1. It sets
-`ALLOW_CORE_DOWNLOADS=0`, uses no-index local installs, and aborts rather than
-downloading vLLM, FlashInfer, CUDA wheels, Python, or uv:
+HPC-only updater. It prefers `venv-py312`, then `h20-new`, then
+`h20-cu129-py312`, and accepts an existing serving stack only when it has Torch
+2.11 with CUDA 12.9 or 13.0, vLLM 0.22.1, Transformers 5.12.1, a working
+`h20-runtime.env`, and eight SM90 GPUs. It preserves that runtime's CUDA
+forward-compatibility setup, uses no-index/no-deps local installs, and has no
+dependency-download path.
+
+Run its read-only preflight first. Success is
+`H20_SPLITK_PREFLIGHT_OK`; this command does not deploy, compile, or install:
+
+```bash
+R='/mnt/public03/task/236362/GQLA'
+RELAY='/root/h20test-splitk-lite-20260818'
+MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
+
+GQLA_ROOT="$R" MODEL_DIR="$MODEL" PREFLIGHT_ONLY=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/update_h20_splitk_only.sh"
+```
+
+Then deploy the plugin and rebuild only HPC-Ops:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
@@ -177,10 +194,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash "$RELAY/deploy/h20-vllm/update_h20_splitk_only.sh"
 ```
 
-The expected existing CUDA 12.9 environment is
-`/mnt/public03/task/236362/GQLA/envs/h20-cu129-py312`. Re-running the command
-reuses that environment and rebuilds HPC-Ops only when requested or when the
-source fingerprint differs. It does not modify the converted checkpoint.
+Success is `H20_SPLITK_HPC_ONLY_OK`. The updater writes
+`h20-splitk-runtime.env` and a build manifest inside the selected venv, keeps
+the compiled wheel under `envs/wheels/hpc-splitk`, and does not modify the
+converted checkpoint. Re-running it intentionally rebuilds the exact
+`de202c9` adaptive split-K source for the selected Torch/CUDA ABI.
 The lower-level `setup_h20_cu129_env.sh` also defaults to
 `ALLOW_CORE_DOWNLOADS=0`; a full environment installation must now opt in
 explicitly with `ALLOW_CORE_DOWNLOADS=1` and should use OSS when direct wheel
