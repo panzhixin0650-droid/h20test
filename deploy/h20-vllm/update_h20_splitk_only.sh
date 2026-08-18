@@ -259,6 +259,14 @@ import wheel
 PY
 command -v g++ >/dev/null 2>&1 || die "g++ is required to compile HPC-Ops"
 
+pip_is_ready=1
+if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    pip_is_ready=0
+    "$PYTHON" -c 'import ensurepip' >/dev/null 2>&1 \
+        || die "existing environment lacks pip and Python's offline ensurepip bootstrap"
+    echo "[hpc-only] pip is absent; the actual update will bootstrap it offline with ensurepip"
+fi
+
 CUDA_TOOLKIT_ROOT=
 CUDA_TOOLKIT_VERSION=
 find_cuda_toolkit \
@@ -268,6 +276,13 @@ echo "[hpc-only] CUDA toolkit=$CUDA_TOOLKIT_ROOT version=$CUDA_TOOLKIT_VERSION"
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
     echo "H20_SPLITK_PREFLIGHT_OK venv=$VENV_DIR runtime_env=$BASE_RUNTIME_ENV_FILE torch_cuda=$TORCH_CUDA_VERSION cuda_toolkit=$CUDA_TOOLKIT_ROOT"
     exit 0
+fi
+
+if [[ "$pip_is_ready" == 0 ]]; then
+    "$PYTHON" -m ensurepip --upgrade --default-pip \
+        || die "offline pip bootstrap failed"
+    "$PYTHON" -m pip --version >/dev/null 2>&1 \
+        || die "pip is still unavailable after offline ensurepip bootstrap"
 fi
 
 echo "[hpc-only] materializing the verified GQLA and HPC-Ops sources"
