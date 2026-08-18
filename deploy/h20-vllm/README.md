@@ -101,15 +101,18 @@ local-only commit that Tencent GitHub cannot serve.
 
 ## Clone and deploy
 
-Run on the H20 machine. Clone the split-K relay beside the existing checkout so
-an older or locally modified `/root/h20test` is not overwritten:
+Run on the H20 machine. Use the lightweight root-history relay branch. It
+contains only the GQLA/vLLM integration, benchmark scripts, the exact 2.8 MB
+HPC-Ops source archive, and one small patch. CPython, uv, wheels, model data,
+and benchmark outputs are deliberately excluded. Clone it beside the existing
+checkout so an older or locally modified `/root/h20test` is not overwritten:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
-RELAY='/root/h20test-splitk-20260818'
-BRANCH='deploy/h20-vllm-splitk-20260818'
+RELAY='/root/h20test-splitk-lite-20260818'
+BRANCH='deploy/h20-vllm-splitk-lite-20260818'
 
-git clone --branch "$BRANCH" --single-branch \
+git clone --depth 1 --branch "$BRANCH" --single-branch \
   https://github.com/panzhixin0650-droid/h20test.git \
   "$RELAY"
 ```
@@ -120,7 +123,7 @@ silently reused:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
-RELAY='/root/h20test-splitk-20260818'
+RELAY='/root/h20test-splitk-lite-20260818'
 MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
 HPC_NEW="$R/code/hpc-ops-de202c9"
 
@@ -136,8 +139,8 @@ If the machine's Git/GnuTLS client cannot complete a GitHub TLS handshake,
 download the same branch through GitHub codeload instead:
 
 ```bash
-RELAY='/root/h20test-splitk-20260818'
-BRANCH='deploy/h20-vllm-splitk-20260818'
+RELAY='/root/h20test-splitk-lite-20260818'
+BRANCH='deploy/h20-vllm-splitk-lite-20260818'
 
 mkdir -p "$RELAY"
 
@@ -149,22 +152,19 @@ tar -xzf /tmp/h20test-splitk.tar.gz \
   --strip-components=1 -C "$RELAY"
 ```
 
-The H20 deployment no longer needs a second GitHub request for HPC-Ops: its
-verified source archive is already inside this transit bundle.
-
-It also contains a SHA256-verified `uv 0.9.3` x86-64 executable. The deployer
-installs it under `GQLA_preprint/tools/uv`, so bootstrap does not depend on the
-often-blocked GitHub Releases object store before Python is available.
-
-A portable, SHA256-verified CPython 3.12.12 runtime is bundled as well and is
-installed under `GQLA/envs/python`. Therefore repairing a copied venv also
-requires no GitHub Releases download.
+The H20 deployment needs no second GitHub request for HPC-Ops: its verified
+source archive is already inside this small transit bundle. The lightweight
+setup reuses an existing `h20-cu129-py312` environment and can install the
+updated editable GQLA package and rebuilt HPC-Ops wheel with that environment's
+pip. If the full serving environment is absent or has the wrong Torch/vLLM
+stack, transfer the environment or wheel bundle through a verified OSS prefix;
+do not put Python, uv, CUDA wheels, or a venv in this Git branch.
 
 Deploy and immediately create/check the environment in one command:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
-RELAY='/root/h20test-splitk-20260818'
+RELAY='/root/h20test-splitk-lite-20260818'
 MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
 HPC_NEW="$R/code/hpc-ops-de202c9"
 
@@ -173,16 +173,16 @@ FORCE_HPC_REBUILD=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash "$RELAY/deploy/h20-vllm/setup_h20_cu129_env.sh"
 ```
 
-The clean CUDA 12.9 environment is installed with `uv` under
+The expected existing CUDA 12.9 environment is
 `/mnt/public03/task/236362/GQLA/envs/h20-cu129-py312`. Re-running the command
-reuses downloaded wheels and rebuilds HPC-Ops only when requested or when the
+reuses that environment and rebuilds HPC-Ops only when requested or when the
 source fingerprint differs. It does not modify the converted checkpoint.
 
 Run the three GQLA C=64 cases separately after setup:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
-RELAY='/root/h20test-splitk-20260818'
+RELAY='/root/h20test-splitk-lite-20260818'
 
 GQLA_ROOT="$R" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash "$RELAY/deploy/h20-vllm/run_h20_tp8_benchmark.sh" gqla 2k

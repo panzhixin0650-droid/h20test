@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Create a clean CUDA 12.9 vLLM environment and build the patched HPC-Ops
-# extension for the exact Torch ABI. Large release wheels are fetched with
-# aria2; the converted model is only validated and is never downloaded.
+# Reuse or create a clean CUDA 12.9 vLLM environment and build the patched
+# HPC-Ops extension for the exact Torch ABI. Existing environments need no
+# bundled Python/uv; a fresh install requires caller-provided Python 3.12 and
+# uv, while large release wheels are fetched with aria2. The converted model
+# is only validated and is never downloaded.
 
 set -Eeuo pipefail
 
@@ -37,6 +39,8 @@ WHEEL_DIR=${WHEEL_DIR:-$ENV_ROOT/wheels/cu129-vllm-0.22.1}
 UV_CACHE_DIR=${UV_CACHE_DIR:-$GQLA_ROOT/.cache/uv-cu129}
 RUNTIME_ENV_FILE=${RUNTIME_ENV_FILE:-$VENV_DIR/h20-runtime.env}
 SETUP_LOG=${SETUP_LOG:-$ENV_ROOT/logs/setup-h20-cu129.log}
+UV_BIN=${UV_BIN:-}
+BASE_PYTHON=${BASE_PYTHON:-}
 
 PYTHON_VERSION=3.12.12
 TORCH_VERSION=2.11.0
@@ -350,6 +354,44 @@ assert Version(version("transformers")).base_version == "5.12.1"
 PY
 }
 
+resolve_setup_tooling() {
+    local candidate
+
+    if [[ -z "$UV_BIN" ]]; then
+        for candidate in "$GQLA_REPO/tools/uv" "$ENV_ROOT/tools/uv"; do
+            if [[ -x "$candidate" ]]; then
+                UV_BIN=$candidate
+                break
+            fi
+        done
+    fi
+    if [[ -z "$UV_BIN" ]] && command -v uv >/dev/null 2>&1; then
+        UV_BIN=$(command -v uv)
+    fi
+
+    if [[ -z "$BASE_PYTHON" ]]; then
+        candidate=$ENV_ROOT/python/cpython-$PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12
+        if [[ -x "$candidate" ]]; then
+            BASE_PYTHON=$candidate
+        elif command -v python3.12 >/dev/null 2>&1; then
+            BASE_PYTHON=$(command -v python3.12)
+        fi
+    fi
+
+    [[ -z "$UV_BIN" || -x "$UV_BIN" ]] \
+        || die "UV_BIN is not executable: $UV_BIN"
+    [[ -z "$BASE_PYTHON" || -x "$BASE_PYTHON" ]] \
+        || die "BASE_PYTHON is not executable: $BASE_PYTHON"
+}
+
+install_into_existing_venv() {
+    if [[ -n "$UV_BIN" ]]; then
+        "$UV_BIN" pip install --no-config --python "$PYTHON" "$@"
+    else
+        "$PYTHON" -m pip install --disable-pip-version-check "$@"
+    fi
+}
+
 find_cuda_toolkit() {
     local candidate release
     local -a candidates=()
@@ -395,6 +437,7 @@ import torch
 
 schema = str(torch.ops.hpc.attention_decode_bf16.default._schema)
 assert "softmax_scale" in schema
+assert "use_splitk" in schema
 assert "Tensor? output" in schema
 PY
 }
@@ -471,7 +514,6 @@ if command -v flock >/dev/null 2>&1; then
     flock 9
 fi
 
-ensure_aria2
 sanitize_cuda13_compat
 
 echo "[setup] materializing GQLA and the patched HPC-Ops source from the GitHub relay bundle"
@@ -484,22 +526,30 @@ HPC_DST="$HPC_OPS_DIR" \
 RUN_INSTALL=0 \
 bash "$DEPLOY_SCRIPT"
 
-UV_BIN=$GQLA_REPO/tools/uv
-BASE_PYTHON=$ENV_ROOT/python/cpython-$PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12
-[[ -x "$UV_BIN" ]] || die "bundled uv was not deployed: $UV_BIN"
-[[ -x "$BASE_PYTHON" ]] || die "bundled Python was not deployed: $BASE_PYTHON"
+resolve_setup_tooling
 
 if [[ "$FORCE_RECREATE" == 1 && -e "$VENV_DIR" ]]; then
+    [[ -n "$UV_BIN" ]] \
+        || die "FORCE_RECREATE=1 requires UV_BIN; transfer the full environment bundle through OSS or provide an existing uv"
+    [[ -n "$BASE_PYTHON" && "$BASE_PYTHON" != "$VENV_DIR/bin/python" ]] \
+        || die "FORCE_RECREATE=1 requires an external Python 3.12; transfer it through OSS or set BASE_PYTHON"
     backup=$VENV_DIR.previous.$(date -u +%Y%m%dT%H%M%SZ)
     mv "$VENV_DIR" "$backup"
     echo "[setup] moved previous environment to $backup"
 fi
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    [[ -n "$UV_BIN" ]] \
+        || die "no existing H20 environment or uv; transfer the full environment bundle through OSS or set UV_BIN"
+    [[ -n "$BASE_PYTHON" ]] \
+        || die "no existing H20 environment or Python 3.12; transfer the full environment bundle through OSS or set BASE_PYTHON"
     echo "[setup] creating fresh Python environment: $VENV_DIR"
     "$UV_BIN" venv --no-project --no-config --allow-existing \
         --python "$BASE_PYTHON" "$VENV_DIR"
 fi
 PYTHON=$VENV_DIR/bin/python
+if [[ -z "$BASE_PYTHON" ]]; then
+    BASE_PYTHON=$PYTHON
+fi
 
 export UV_CACHE_DIR
 export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-900}
@@ -508,6 +558,9 @@ export UV_CONCURRENT_DOWNLOADS UV_CONCURRENT_INSTALLS
 export UV_TORCH_BACKEND=cu129
 
 if ! core_stack_is_ready; then
+    [[ -n "$UV_BIN" ]] \
+        || die "existing environment is not torch 2.11/cu129 + vLLM 0.22.1 and uv is unavailable; relay the full environment through OSS"
+    ensure_aria2
     prepare_large_wheels
     mapfile -t accelerated_wheels \
         <"$WHEEL_DIR/aria2-accelerated-wheel-paths.txt"
@@ -524,8 +577,7 @@ else
 fi
 core_stack_is_ready || die "installed core stack does not match torch 2.11/cu129 + vLLM 0.22.1"
 
-"$UV_BIN" pip install --no-config --python "$PYTHON" --no-deps \
-    --no-build-isolation --editable "$GQLA_REPO"
+install_into_existing_venv --no-deps --no-build-isolation --editable "$GQLA_REPO"
 
 CUDA_TOOLKIT_ROOT=
 CUDA_TOOLKIT_VERSION=
@@ -568,8 +620,7 @@ if [[ "$FORCE_HPC_REBUILD" == 1 ]] || ! hpc_runtime_is_ready "$source_hash"; the
     mapfile -t hpc_wheels < <(find "$wheelhouse" -maxdepth 1 -type f -name 'hpc_ops-*.whl' -print)
     (( ${#hpc_wheels[@]} == 1 )) \
         || die "expected one HPC-Ops wheel, found ${#hpc_wheels[@]}"
-    "$UV_BIN" pip install --no-config --python "$PYTHON" --no-deps \
-        --reinstall "${hpc_wheels[0]}"
+    install_into_existing_venv --no-deps --reinstall "${hpc_wheels[0]}"
     printf '%s\n' "$source_hash" >"$VENV_DIR/.hpc-source.sha256"
 else
     echo "[setup] matching patched HPC-Ops wheel is already installed"
@@ -621,6 +672,7 @@ import hpc  # noqa: E402
 
 schema = str(torch.ops.hpc.attention_decode_bf16.default._schema)
 assert "softmax_scale" in schema, schema
+assert "use_splitk" in schema, schema
 print(
     "H20_CU129_SETUP_OK",
     f"torch={torch.__version__}",
