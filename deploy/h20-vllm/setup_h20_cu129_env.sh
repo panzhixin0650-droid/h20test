@@ -63,6 +63,7 @@ UV_CONCURRENT_INSTALLS=${UV_CONCURRENT_INSTALLS:-16}
 MAX_JOBS=${MAX_JOBS:-16}
 FORCE_RECREATE=${FORCE_RECREATE:-0}
 FORCE_HPC_REBUILD=${FORCE_HPC_REBUILD:-0}
+ALLOW_CORE_DOWNLOADS=${ALLOW_CORE_DOWNLOADS:-0}
 DRY_RUN=${DRY_RUN:-0}
 
 # Exact large dependencies selected by the torch 2.11.0/cu129 and vLLM 0.22.1
@@ -386,9 +387,9 @@ resolve_setup_tooling() {
 
 install_into_existing_venv() {
     if [[ -n "$UV_BIN" ]]; then
-        "$UV_BIN" pip install --no-config --python "$PYTHON" "$@"
+        "$UV_BIN" pip install --no-config --no-index --python "$PYTHON" "$@"
     else
-        "$PYTHON" -m pip install --disable-pip-version-check "$@"
+        "$PYTHON" -m pip install --disable-pip-version-check --no-index "$@"
     fi
 }
 
@@ -476,6 +477,7 @@ write_runtime_env() {
 
 require_bool FORCE_RECREATE "$FORCE_RECREATE"
 require_bool FORCE_HPC_REBUILD "$FORCE_HPC_REBUILD"
+require_bool ALLOW_CORE_DOWNLOADS "$ALLOW_CORE_DOWNLOADS"
 require_bool DRY_RUN "$DRY_RUN"
 require_bool ARIA2_ACCELERATE_DEPS "$ARIA2_ACCELERATE_DEPS"
 [[ "$ARIA2_MIN_WHEEL_MIB" =~ ^[1-9][0-9]*$ ]] \
@@ -498,6 +500,7 @@ TORCH_WHEEL_URL=$TORCH_WHEEL_URL
 VLLM_WHEEL_URL=$VLLM_WHEEL_URL
 ARIA2_ACCELERATE_DEPS=$ARIA2_ACCELERATE_DEPS
 ARIA2_MIN_WHEEL_MIB=$ARIA2_MIN_WHEEL_MIB
+ALLOW_CORE_DOWNLOADS=$ALLOW_CORE_DOWNLOADS
 RUNTIME_ENV_FILE=$RUNTIME_ENV_FILE
 EOF
     exit 0
@@ -558,6 +561,8 @@ export UV_CONCURRENT_DOWNLOADS UV_CONCURRENT_INSTALLS
 export UV_TORCH_BACKEND=cu129
 
 if ! core_stack_is_ready; then
+    [[ "$ALLOW_CORE_DOWNLOADS" == 1 ]] || die \
+        "existing environment is not torch 2.11/cu129 + vLLM 0.22.1; refusing core-wheel downloads (use the HPC-only updater with a matching VENV_DIR, or explicitly set ALLOW_CORE_DOWNLOADS=1 for a full environment install)"
     [[ -n "$UV_BIN" ]] \
         || die "existing environment is not torch 2.11/cu129 + vLLM 0.22.1 and uv is unavailable; relay the full environment through OSS"
     ensure_aria2
