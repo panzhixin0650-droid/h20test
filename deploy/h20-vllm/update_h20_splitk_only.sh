@@ -134,6 +134,43 @@ PY
     return 1
 }
 
+find_cuda_cudart() {
+    local candidate name
+    local -a candidates=()
+
+    candidates+=(
+        "$CUDA_TOOLKIT_ROOT/lib/libcudart.so"
+        "$CUDA_TOOLKIT_ROOT/lib64/libcudart.so"
+    )
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] && candidates+=("$candidate")
+    done < <("$PYTHON" - "$TORCH_CUDA_MAJOR" <<'PY'
+import site
+import sys
+from pathlib import Path
+
+major = sys.argv[1]
+for site_dir in site.getsitepackages():
+    runtime_dir = Path(site_dir) / "nvidia" / "cuda_runtime" / "lib"
+    for library in sorted(runtime_dir.glob(f"libcudart.so.{major}*")):
+        if library.is_file():
+            print(library)
+PY
+)
+
+    for candidate in "${candidates[@]}"; do
+        [[ -f "$candidate" ]] || continue
+        name=${candidate##*/}
+        case "$name" in
+            libcudart.so|libcudart.so."$TORCH_CUDA_MAJOR"*)
+                CUDA_CUDART_LIBRARY=$candidate
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 hpc_source_hash() {
     find \
         "$HPC_OPS_DIR/CMakeLists.txt" \
@@ -272,9 +309,13 @@ CUDA_TOOLKIT_VERSION=
 find_cuda_toolkit \
     || die "existing runtime does not expose nvcc >=12.8 matching torch CUDA $TORCH_CUDA_VERSION"
 echo "[hpc-only] CUDA toolkit=$CUDA_TOOLKIT_ROOT version=$CUDA_TOOLKIT_VERSION"
+CUDA_CUDART_LIBRARY=
+find_cuda_cudart \
+    || die "existing runtime does not expose libcudart for CUDA major $TORCH_CUDA_MAJOR"
+echo "[hpc-only] CUDA runtime=$CUDA_CUDART_LIBRARY"
 
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
-    echo "H20_SPLITK_PREFLIGHT_OK venv=$VENV_DIR runtime_env=$BASE_RUNTIME_ENV_FILE torch_cuda=$TORCH_CUDA_VERSION cuda_toolkit=$CUDA_TOOLKIT_ROOT"
+    echo "H20_SPLITK_PREFLIGHT_OK venv=$VENV_DIR runtime_env=$BASE_RUNTIME_ENV_FILE torch_cuda=$TORCH_CUDA_VERSION cuda_toolkit=$CUDA_TOOLKIT_ROOT cudart=$CUDA_CUDART_LIBRARY"
     exit 0
 fi
 
@@ -309,13 +350,24 @@ export CUDA_HOME=$CUDA_TOOLKIT_ROOT
 export CUDAToolkit_ROOT=$CUDA_TOOLKIT_ROOT
 export CUDACXX=$CUDA_TOOLKIT_ROOT/bin/nvcc
 export PATH="$VENV_DIR/bin:$CUDA_TOOLKIT_ROOT/bin:$PATH"
+CUDA_CUDART_LIBRARY=$(cd "$(dirname "$CUDA_CUDART_LIBRARY")" && pwd -P)/$(basename "$CUDA_CUDART_LIBRARY")
+cudart_link_dir=$(dirname "$CUDA_CUDART_LIBRARY")
+if [[ "$(basename "$CUDA_CUDART_LIBRARY")" != libcudart.so ]]; then
+    cudart_link_dir=$ENV_ROOT/cuda-cudart-links/cu$TORCH_CUDA_MAJOR
+    mkdir -p "$cudart_link_dir"
+    ln -sfn "$CUDA_CUDART_LIBRARY" "$cudart_link_dir/libcudart.so"
+    ln -sfn "$CUDA_CUDART_LIBRARY" "$cudart_link_dir/libcudart.so.$TORCH_CUDA_MAJOR"
+    ln -sfn "$CUDA_CUDART_LIBRARY" "$cudart_link_dir/$(basename "$CUDA_CUDART_LIBRARY")"
+fi
 torch_lib=$("$PYTHON" -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "lib")')
 if [[ -d "$CUDA_TOOLKIT_ROOT/lib" ]]; then
     toolkit_lib=$CUDA_TOOLKIT_ROOT/lib
 else
     toolkit_lib=$CUDA_TOOLKIT_ROOT/lib64
 fi
-export LD_LIBRARY_PATH="$toolkit_lib:$torch_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CMAKE_LIBRARY_PATH="$cudart_link_dir${CMAKE_LIBRARY_PATH:+:$CMAKE_LIBRARY_PATH}"
+export LIBRARY_PATH="$cudart_link_dir${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$cudart_link_dir:$toolkit_lib:$torch_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CMAKE_PREFIX_PATH="$("$PYTHON" -c 'import torch; print(torch.utils.cmake_prefix_path)')${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export CMAKE_GENERATOR=Ninja
 export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
@@ -408,6 +460,7 @@ PY
     printf 'export VENV_DIR=%q\n' "$VENV_DIR"
     printf 'export PYTHON=%q\n' "$PYTHON"
     printf 'export PYTHONPATH=%q${PYTHONPATH:+:$PYTHONPATH}\n' "$GQLA_REPO"
+    printf 'export LD_LIBRARY_PATH=%q${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' "$cudart_link_dir"
 } >"$SPLITK_RUNTIME_ENV_FILE"
 
 cat >"$VENV_DIR/h20-splitk-manifest.env" <<EOF
@@ -421,6 +474,8 @@ venv_dir=$VENV_DIR
 python=$PYTHON
 torch_cuda=$($PYTHON -c 'import torch; print(torch.version.cuda)')
 cuda_toolkit=$CUDA_TOOLKIT_ROOT
+cudart_library=$CUDA_CUDART_LIBRARY
+cudart_link_dir=$cudart_link_dir
 hpc_source_commit=$EXPECTED_HPC_COMMIT
 hpc_source_hash=$source_hash
 hpc_wheel=$installed_wheel
