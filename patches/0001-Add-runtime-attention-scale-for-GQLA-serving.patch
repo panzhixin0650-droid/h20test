@@ -1,0 +1,527 @@
+From f85ce8457ce6ef46c4c89736576792f14533cc48 Mon Sep 17 00:00:00 2001
+From: panzhixin0650-droid <panzhixin0650-droid@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 20:38:12 +0800
+Subject: [PATCH] Add runtime attention scale for GQLA serving
+
+---
+ CMakeLists.txt                                |  4 +-
+ hpc/attention.py                              |  7 +++-
+ setup.py                                      | 16 ++++++--
+ src/attention/decode/decode.cc                | 10 +++--
+ src/attention/decode/decode.h                 |  2 +-
+ .../dynamic/smallm_bf16_dim128_dynamic.cu     | 11 +++---
+ ...llm_bf16_dim128_dynamic_splitk_kernels.cuh |  4 +-
+ .../sm90/static/smallm_bf16_dim128_static.cu  | 19 ++++++----
+ ...allm_bf16_dim128_static_splitk_kernels.cuh |  4 +-
+ src/attention/decode/smallm_dim128.h          |  9 +++--
+ src/attention/entry.cc                        | 17 +++++++--
+ tests/test_attention_decode_bf16_gqla.py      | 38 +++++++++++++++++--
+ 12 files changed, 104 insertions(+), 37 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6737bf1..12f0eb8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -54,7 +54,7 @@ target_compile_definitions(
+ )
+ 
+ execute_process(
+-  COMMAND python3 -c "
++  COMMAND ${Python3_EXECUTABLE} -c "
+ from torch.utils.cpp_extension import include_paths
+ print(';'.join(include_paths()), end='')
+ "
+@@ -62,7 +62,7 @@ print(';'.join(include_paths()), end='')
+ )
+ 
+ execute_process(
+-  COMMAND python3 -c "
++  COMMAND ${Python3_EXECUTABLE} -c "
+ from torch.utils.cpp_extension import library_paths
+ print(';'.join(library_paths()), end='')
+ "
+diff --git a/hpc/attention.py b/hpc/attention.py
+index 6f67402..73cdbea 100644
+--- a/hpc/attention.py
++++ b/hpc/attention.py
+@@ -350,6 +350,7 @@ def attention_decode_bf16(
+     task_map: Tensor = None,
+     split_flag: Tensor = None,
+     output: Tensor = None,
++    softmax_scale: float = None,
+ ) -> Tensor:
+     """Computes attention decode using bfloat16 precision.
+ 
+@@ -389,6 +390,8 @@ def attention_decode_bf16(
+         output: Output tensor for store output value inplace.
+             Shape: [num_batch * num_seq_q, num_head_q, num_dim_v]
+             Dtype: bfloat16
++        softmax_scale: Scale applied to query-key scores before softmax. If None,
++            defaults to ``1 / sqrt(num_dim_qk)``.
+     Returns:
+         output: Output tensor for store output value.
+             Shape: [num_batch * num_seq_q, num_head_q, num_dim_v]
+@@ -420,6 +423,7 @@ def attention_decode_bf16(
+         task_map,
+         split_flag,
+         output,
++        softmax_scale,
+     )
+ 
+ 
+@@ -770,8 +774,9 @@ def attention_decode_bf16_fake(
+     task_map=None,
+     split_flag=None,
+     output=None,
++    softmax_scale=None,
+ ):
+-    return torch.empty_like(q)
++    return torch.empty((q.size(0), q.size(1), vcache.size(-1)), dtype=q.dtype, device=q.device)
+ 
+ 
+ @torch.library.register_fake("hpc::attention_decode_fp8")
+diff --git a/setup.py b/setup.py
+index 9dcd654..3c50ed7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -46,9 +46,19 @@ class CMakeBuild(build_ext):
+ 
+ 
+ def get_version():
+-    git_hash = subprocess.check_output(
+-        ["git", "rev-parse", "--short=7", "HEAD"], stderr=subprocess.DEVNULL, text=True
+-    ).strip()
++    # Source archives and DLC-mounted code directories do not always retain
++    # .git. The benchmark bootstrap supplies a content-derived seven-character
++    # override so the wheel can still be built and remains traceable to the
++    # exact source tree used for that run.
++    git_hash = os.environ.get("HPC_GIT_HASH_OVERRIDE", "").strip()
++    if not git_hash:
++        git_hash = subprocess.check_output(
++            ["git", "rev-parse", "--short=7", "HEAD"],
++            stderr=subprocess.DEVNULL,
++            text=True,
++        ).strip()
++    if not git_hash.isalnum():
++        raise ValueError(f"invalid HPC git/source hash: {git_hash!r}")
+ 
+     return f"0.0.1.dev0+g{git_hash}", git_hash
+ 
+diff --git a/src/attention/decode/decode.cc b/src/attention/decode/decode.cc
+index ae8c2be..9f9a1e9 100644
+--- a/src/attention/decode/decode.cc
++++ b/src/attention/decode/decode.cc
+@@ -19,7 +19,7 @@ bool attention_decode_bf16_async(
+     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int ldY, int ldQ,
+     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
+     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
+-    cudaStream_t stream) {
++    float softmax_scale, cudaStream_t stream) {
+   if (num_dim_qk == 128 && num_dim_v == 128) {
+     if (task_map_ptr) {
+       return smallm_bf16_dim128_dynamic_async(
+@@ -27,14 +27,15 @@ bool attention_decode_bf16_async(
+           splitk, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v,
+           num_kvcache_blocks, block_size, num_seq_max_blocks, ldQ, kcache_block_stride,
+           kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+-          vcache_head_stride, stream);
++          vcache_head_stride, softmax_scale, stream);
+     } else {
+       return smallm_bf16_dim128_static_async(
+           y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+           num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch, num_seq_q,
+           num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+           num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+-          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
++          softmax_scale, stream);
+     }
+   } else if (num_dim_qk == 192 && num_dim_v == 128) {
+     if (!task_map_ptr) {
+@@ -43,7 +44,8 @@ bool attention_decode_bf16_async(
+           num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch, num_seq_q,
+           num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+           num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+-          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
++          softmax_scale, stream);
+     }
+   }
+   return false;
+diff --git a/src/attention/decode/decode.h b/src/attention/decode/decode.h
+index c155be6..6f523d2 100644
+--- a/src/attention/decode/decode.h
++++ b/src/attention/decode/decode.h
+@@ -22,7 +22,7 @@ bool attention_decode_bf16_async(
+     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int ldY, int ldQ,
+     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
+     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
+-    cudaStream_t stream);
++    float softmax_scale, cudaStream_t stream);
+ 
+ bool attention_decode_fp8_async(
+     void *y_ptr, void *lse_ptr, void *split_out_ptr, const int *task_map_ptr, const void *q_ptr,
+diff --git a/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic.cu b/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic.cu
+index 90c7593..331fc4d 100644
+--- a/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic.cu
++++ b/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic.cu
+@@ -39,7 +39,7 @@ static void launch_smallm_bf16_dim128_dynamic_splitk_kernel(
+     int num_dim_v, int num_kvcache_blocks, int num_seq_max_blocks, int ldQ,
+     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
+     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
+-    int max_splitk, cudaStream_t stream) {
++    int max_splitk, float softmax_scale, cudaStream_t stream) {
+   using namespace cute;  // NOLINT
+ 
+   constexpr int kStage = 2;
+@@ -112,7 +112,7 @@ static void launch_smallm_bf16_dim128_dynamic_splitk_kernel(
+   int shm_size = std::max(shm_qkv + shm_blk_ids, shm_splity);
+ 
+   constexpr float kLog2e = 1.4426950408889634f;
+-  float one_over_dk_log2e = 1.f / sqrtf(float(num_dim_qk)) * kLog2e;
++  float softmax_scale_log2e = softmax_scale * kLog2e;
+ 
+   int num_sm = get_sm_count();
+   int num_total_ctas = num_sm * dynamic::kCtaPerSmMap.at(9)[num_seq_q - 1];
+@@ -146,7 +146,7 @@ static void launch_smallm_bf16_dim128_dynamic_splitk_kernel(
+                      reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr),
+                      task_map_ptr, block_ids_ptr, num_batch, num_seq_q, num_dim_qk, num_dim_v,
+                      num_head_q, num_head_k, num_head_v, heads_per_group, pad_heads_per_group,
+-                     num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e, max_splitk);
++                     num_kvcache_blocks, num_seq_max_blocks, softmax_scale_log2e, max_splitk);
+ 
+   // ---- adaptive combine: LSE-weighted reduction across chunks ----
+   cutlass::FastDivmod heads_per_group_divmod(heads_per_group);
+@@ -190,7 +190,8 @@ bool smallm_bf16_dim128_dynamic_async(void *y_ptr, void *lse_ptr, void *splitk_o
+                                       int num_seq_max_blocks, int ldQ, int64_t kcache_block_stride,
+                                       int64_t kcache_token_stride, int64_t kcache_head_stride,
+                                       int64_t vcache_block_stride, int64_t vcache_token_stride,
+-                                      int64_t vcache_head_stride, cudaStream_t stream) {
++                                      int64_t vcache_head_stride, float softmax_scale,
++                                      cudaStream_t stream) {
+   using namespace cute;  // NOLINT
+ 
+   constexpr int kTileN = 64;
+@@ -221,7 +222,7 @@ bool smallm_bf16_dim128_dynamic_async(void *y_ptr, void *lse_ptr, void *splitk_o
+         num_batch, num_seq_q, num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk,
+         num_dim_v, num_kvcache_blocks, num_seq_max_blocks, ldQ, kcache_block_stride,
+         kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+-        vcache_head_stride, splitk, stream);
++        vcache_head_stride, splitk, softmax_scale, stream);
+   };
+ 
+   auto dispatch_block_size = [&](auto tilem_tag) {
+diff --git a/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic_splitk_kernels.cuh b/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic_splitk_kernels.cuh
+index f28a964..5ddf34d 100644
+--- a/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic_splitk_kernels.cuh
++++ b/src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic_splitk_kernels.cuh
+@@ -32,7 +32,7 @@ __global__ void smallm_attention_decode_bf16_dynamic_splitk_kernel(
+     float* split_y_ptr, float* lse_ptr, const int* task_map_ptr, const int* block_ids_ptr,
+     int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k,
+     int num_head_v, int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
+-    int num_seq_max_blocks, float one_over_dk_log2e, int max_splitk) {
++    int num_seq_max_blocks, float softmax_scale_log2e, int max_splitk) {
+   using namespace cute;  // NOLINT
+ 
+   constexpr int kMathThreads = size(TiledMmaQK{});
+@@ -259,7 +259,7 @@ __global__ void smallm_attention_decode_bf16_dynamic_splitk_kernel(
+ 
+       clear(gSum);
+       fill(gMax, -std::numeric_limits<float>::infinity());
+-      fill(gSoftmaxScale, one_over_dk_log2e);
++      fill(gSoftmaxScale, softmax_scale_log2e);
+       clear(tYr);
+       tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
+ 
+diff --git a/src/attention/decode/sm90/static/smallm_bf16_dim128_static.cu b/src/attention/decode/sm90/static/smallm_bf16_dim128_static.cu
+index 5406825..30bbd62 100644
+--- a/src/attention/decode/sm90/static/smallm_bf16_dim128_static.cu
++++ b/src/attention/decode/sm90/static/smallm_bf16_dim128_static.cu
+@@ -39,7 +39,8 @@ void launch_smallm_bf16_static_splitk_kernel(
+     int num_head_v, int heads_per_group, int num_dim_qk, int num_dim_v, int num_kvcache_blocks,
+     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
++    int64_t vcache_token_stride, int64_t vcache_head_stride, float softmax_scale,
++    cudaStream_t stream) {
+   using namespace cute;  // NOLINT
+   constexpr int kStage = 2;
+ 
+@@ -128,7 +129,7 @@ void launch_smallm_bf16_static_splitk_kernel(
+   int shm_size = std::max(shm_qkv + shm_blk_ids, shm_y);
+ 
+   constexpr float kLog2e = 1.4426950408889634f;
+-  float one_over_dk_log2e = 1.f / sqrtf(float(num_dim_qk)) * kLog2e;
++  float softmax_scale_log2e = softmax_scale * kLog2e;
+ 
+   auto kernel = kernels::smallm_attention_decode_bf16_static_splitk_kernel<
+       Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, TiledMmaQK, TiledMmaSV,
+@@ -145,7 +146,7 @@ void launch_smallm_bf16_static_splitk_kernel(
+       reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr), block_ids_ptr,
+       num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_dim_qk,
+       num_dim_v, num_head_q, num_head_k, num_head_v, heads_per_group, pad_heads_per_group,
+-      num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e);
++      num_kvcache_blocks, num_seq_max_blocks, softmax_scale_log2e);
+ }
+ 
+ bool smallm_bf16_dim128_static_async(
+@@ -155,7 +156,8 @@ bool smallm_bf16_dim128_static_async(
+     int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+     int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
++    int64_t vcache_token_stride, int64_t vcache_head_stride, float softmax_scale,
++    cudaStream_t stream) {
+   using namespace cute;  // NOLINT
+ 
+   constexpr int kTileN = 64;
+@@ -183,7 +185,8 @@ bool smallm_bf16_dim128_static_async(
+         num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
+         num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
+         block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+-        kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++        kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
++        softmax_scale, stream);
+   };
+ 
+   auto dispatch_block_size = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag) {
+@@ -222,7 +225,8 @@ bool smallm_bf16_qk192_v128_static_async(
+     int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+     int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
++    int64_t vcache_token_stride, int64_t vcache_head_stride, float softmax_scale,
++    cudaStream_t stream) {
+   using namespace cute;  // NOLINT
+ 
+   constexpr int kTileN = 64;
+@@ -254,7 +258,8 @@ bool smallm_bf16_qk192_v128_static_async(
+         num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
+         num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
+         block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+-        kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++        kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
++        softmax_scale, stream);
+   };
+ 
+   // The upstream split-K LSE layout assumes at most eight heads per group.  The entry point
+diff --git a/src/attention/decode/sm90/static/smallm_bf16_dim128_static_splitk_kernels.cuh b/src/attention/decode/sm90/static/smallm_bf16_dim128_static_splitk_kernels.cuh
+index 903f4c4..4ee18df 100644
+--- a/src/attention/decode/sm90/static/smallm_bf16_dim128_static_splitk_kernels.cuh
++++ b/src/attention/decode/sm90/static/smallm_bf16_dim128_static_splitk_kernels.cuh
+@@ -34,7 +34,7 @@ __global__ void smallm_attention_decode_bf16_static_splitk_kernel(
+     bool new_kv_included, int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v,
+     int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+     int lse_pad_heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks,
+-    float one_over_dk_log2e) {
++    float softmax_scale_log2e) {
+   using namespace cute;  // NOLINT
+ 
+   int idx = threadIdx.x;
+@@ -240,7 +240,7 @@ __global__ void smallm_attention_decode_bf16_static_splitk_kernel(
+ 
+     clear(gSum);
+     fill(gMax, -std::numeric_limits<float>::infinity());
+-    fill(gSoftmaxScale, one_over_dk_log2e);
++    fill(gSoftmaxScale, softmax_scale_log2e);
+ 
+     using STSM_ATOM =
+         std::conditional_t<kTileM % 16 == 0, cute::SM90_U16x8_STSM_T, cute::SM90_U16x4_STSM_T>;
+diff --git a/src/attention/decode/smallm_dim128.h b/src/attention/decode/smallm_dim128.h
+index aca592f..b8591fa 100644
+--- a/src/attention/decode/smallm_dim128.h
++++ b/src/attention/decode/smallm_dim128.h
+@@ -16,7 +16,8 @@ bool smallm_bf16_dim128_static_async(
+     int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+     int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream);
++    int64_t vcache_token_stride, int64_t vcache_head_stride, float softmax_scale,
++    cudaStream_t stream);
+ 
+ bool smallm_bf16_dim128_dynamic_async(void *y_ptr, void *lse_ptr, void *split_out_ptr,
+                                       const int *task_map_ptr, const void *q_ptr, void *kcache_ptr,
+@@ -27,7 +28,8 @@ bool smallm_bf16_dim128_dynamic_async(void *y_ptr, void *lse_ptr, void *split_ou
+                                       int num_seq_max_blocks, int ldQ, int64_t kcache_block_stride,
+                                       int64_t kcache_token_stride, int64_t kcache_head_stride,
+                                       int64_t vcache_block_stride, int64_t vcache_token_stride,
+-                                      int64_t vcache_head_stride, cudaStream_t stream);
++                                      int64_t vcache_head_stride, float softmax_scale,
++                                      cudaStream_t stream);
+ 
+ bool smallm_bf16_qk192_v128_static_async(
+     void *y_ptr, void *lse_ptr, void *split_out_ptr, const void *q_ptr, void *kcache_ptr,
+@@ -36,7 +38,8 @@ bool smallm_bf16_qk192_v128_static_async(
+     int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+     int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream);
++    int64_t vcache_token_stride, int64_t vcache_head_stride, float softmax_scale,
++    cudaStream_t stream);
+ 
+ bool smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_async(
+     void *y_ptr, void *lse_ptr, void *split_out_ptr, const int *task_map_ptr, const void *q_ptr,
+diff --git a/src/attention/entry.cc b/src/attention/entry.cc
+index 8af1c5c..f57ff27 100644
+--- a/src/attention/entry.cc
++++ b/src/attention/entry.cc
+@@ -5,6 +5,8 @@
+ #include <torch/all.h>
+ #include <torch/library.h>
+ 
++#include <cmath>
++
+ #include "src/attention/decode/decode.h"
+ #include "src/attention/prefill/prefill.h"
+ #include "src/utils/utils.h"
+@@ -414,7 +416,8 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor
+                                           bool new_kv_included, bool use_splitk,
+                                           std::optional<torch::Tensor> task_map,
+                                           std::optional<torch::Tensor> split_flag,
+-                                          std::optional<torch::Tensor> output) {
++                                          std::optional<torch::Tensor> output,
++                                          std::optional<double> softmax_scale) {
+   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+ 
+   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+@@ -434,6 +437,10 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor
+   TORCH_CHECK(num_seq_q == mtp + 1, "every request num_seq_q must be mtp + 1");
+   int num_head_q = q.size(1);
+   int num_dim_qk = q.size(2);
++  float resolved_softmax_scale = softmax_scale.has_value()
++                                     ? static_cast<float>(softmax_scale.value())
++                                     : 1.0f / std::sqrt(static_cast<float>(num_dim_qk));
++  TORCH_CHECK(std::isfinite(resolved_softmax_scale), "softmax_scale must be finite");
+ 
+   int num_kvcache_blocks = kcache.size(0);
+   int block_size = kcache.size(1);
+@@ -543,7 +550,8 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor
+         num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, actual_splitk, num_batch, num_seq_q,
+         num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+         num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
+-        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++        vcache_block_stride, vcache_token_stride, vcache_head_stride, resolved_softmax_scale,
++        stream);
+     TORCH_CHECK(running, "attn decode kernel launch failed!");
+     return y;
+   }
+@@ -590,7 +598,8 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor
+       block_ids_ptr, num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch,
+       num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks,
+       block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+-      kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
++      kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
++      resolved_softmax_scale, stream);
+ 
+   TORCH_CHECK(running, "attn decode kernel launch failed!");
+ 
+@@ -882,7 +891,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
+   m.def(
+       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
+       "num_seq_kvcache, int mtp, bool new_kv_included, bool use_splitk, Tensor? task_map, "
+-      "Tensor? split_flag, Tensor? output) -> "
++      "Tensor? split_flag, Tensor? output, float? softmax_scale=None) -> "
+       "(Tensor)");
+   m.impl("attention_decode_bf16", torch::kCUDA, &hpc::attention::attention_decode_bf16_entry);
+ 
+diff --git a/tests/test_attention_decode_bf16_gqla.py b/tests/test_attention_decode_bf16_gqla.py
+index 0f977b9..56d0bca 100644
+--- a/tests/test_attention_decode_bf16_gqla.py
++++ b/tests/test_attention_decode_bf16_gqla.py
+@@ -11,7 +11,10 @@ import pytest
+ import torch
+ 
+ 
+-sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
++default_build_lib = os.path.realpath(
++    list(Path(__file__).parent.glob("../build/lib.*/"))[0]
++)
++sys.path.insert(0, os.environ.get("HPC_TEST_BUILD_DIR", default_build_lib))
+ 
+ import hpc  # noqa: E402
+ 
+@@ -20,6 +23,11 @@ BLOCK_SIZE = 64
+ GLOBAL_NUM_HEAD_Q = 128
+ QK_DIM = 192
+ V_DIM = 128
++DEEPSEEK_YARN_FACTOR = 40.0
++DEEPSEEK_YARN_MSCALE_ALL_DIM = 1.0
++DEEPSEEK_YARN_SCALE = (
++    1.0 + 0.1 * DEEPSEEK_YARN_MSCALE_ALL_DIM * math.log(DEEPSEEK_YARN_FACTOR)
++) ** 2 / math.sqrt(QK_DIM)
+ TP_CASES = tuple(
+     (global_num_head_kv, num_seq_q, tp_size)
+     for global_num_head_kv in (8, 4)
+@@ -70,7 +78,15 @@ def _make_inputs(num_head_q: int, num_head_kv: int, num_seq_q: int, seed: int):
+ 
+ 
+ def _reference(
+-    q, kcache, vcache, block_ids, total_lens, num_head_q, num_head_kv, num_seq_q
++    q,
++    kcache,
++    vcache,
++    block_ids,
++    total_lens,
++    num_head_q,
++    num_head_kv,
++    num_seq_q,
++    softmax_scale=None,
+ ):
+     num_batch = total_lens.numel()
+     heads_per_group = num_head_q // num_head_kv
+@@ -92,7 +108,9 @@ def _reference(
+         k = k.transpose(0, 1).repeat_interleave(heads_per_group, dim=0).float()
+         v = v.transpose(0, 1).repeat_interleave(heads_per_group, dim=0).float()
+ 
+-        scores = torch.matmul(q_batch, k.transpose(-1, -2)) / math.sqrt(QK_DIM)
++        if softmax_scale is None:
++            softmax_scale = 1.0 / math.sqrt(QK_DIM)
++        scores = torch.matmul(q_batch, k.transpose(-1, -2)) * softmax_scale
+         key_positions = torch.arange(total_len, device="cuda")
+         query_limits = total_len - num_seq_q + torch.arange(num_seq_q, device="cuda")
+         causal_mask = key_positions.unsqueeze(0) <= query_limits.unsqueeze(1)
+@@ -108,6 +126,7 @@ def _run_case(
+     tp_size: int,
+     splitk: bool,
+     use_output: bool = True,
++    softmax_scale=None,
+ ):
+     local_num_head_q = GLOBAL_NUM_HEAD_Q // tp_size
+     local_num_head_kv = max(global_num_head_kv // tp_size, 1)
+@@ -124,6 +143,7 @@ def _run_case(
+         local_num_head_q,
+         local_num_head_kv,
+         num_seq_q,
++        softmax_scale,
+     )
+     kwargs = {}
+     if use_output:
+@@ -140,6 +160,7 @@ def _run_case(
+         mtp=num_seq_q - 1,
+         new_kv_included=True,
+         splitk=splitk,
++        softmax_scale=softmax_scale,
+         **kwargs,
+     )
+     torch.cuda.synchronize()
+@@ -161,6 +182,17 @@ def test_gqla_splitk_hint_falls_back_to_single_split(num_head_kv, num_seq_q):
+     _run_case(num_head_kv, num_seq_q, 1, splitk=True)
+ 
+ 
++@pytest.mark.parametrize("num_head_kv,num_seq_q", [(8, 1), (4, 2)])
++def test_gqla_deepseek_yarn_softmax_scale(num_head_kv, num_seq_q):
++    _run_case(
++        num_head_kv,
++        num_seq_q,
++        tp_size=1,
++        splitk=False,
++        softmax_scale=DEEPSEEK_YARN_SCALE,
++    )
++
++
+ def test_gqla_allocates_v_sized_output():
+     _run_case(
+         global_num_head_kv=8,
+-- 
+2.43.0
+
