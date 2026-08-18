@@ -280,7 +280,7 @@ HPC_DST="$HPC_OPS_DIR" \
 RUN_INSTALL=0 \
 bash "$DEPLOY_SCRIPT"
 
-current_commit=$(git -C "$HPC_OPS_DIR" rev-parse HEAD 2>/dev/null || true)
+current_commit=$(git -C "$HPC_OPS_DIR" rev-parse --verify HEAD 2>/dev/null || true)
 if [[ -z "$current_commit" && -f "$HPC_OPS_DIR/.gqla_hpc_source_commit" ]]; then
     current_commit=$(<"$HPC_OPS_DIR/.gqla_hpc_source_commit")
 fi

@@ -61,7 +61,7 @@ validate_gqla_splitk_runtime() {
     local expected_commit=de202c9bda942fdfd499d09e51ea6ff9c89c5d50
     local current_commit current_hash installed_hash backend
 
-    current_commit=$(git -C "$HPC_OPS_DIR" rev-parse HEAD 2>/dev/null || true)
+    current_commit=$(git -C "$HPC_OPS_DIR" rev-parse --verify HEAD 2>/dev/null || true)
     if [[ -z "$current_commit" && -f "$HPC_OPS_DIR/.gqla_hpc_source_commit" ]]; then
         current_commit=$(<"$HPC_OPS_DIR/.gqla_hpc_source_commit")
     fi
