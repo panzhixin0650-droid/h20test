@@ -24,11 +24,12 @@ H20 单机 8 卡上使用 `TP=8` 成对测试 MLA 和 GQLA/HPC 时，使用固�
 
 | route | architecture | KV/attention 路径 | 路由证明 |
 |---|---|---|---|
-| `gqa-hpc` | `DeepseekV3GQLAHPCForCausalLM` | 真实 GQA cache；所有 decode 使用 HPC-Ops；纯 prefill 使用 DiffKV，混合 batch 只把 prefill 后缀交给 DiffKV | server 继承 `GQLA_HPC_STRICT=1`、`GQLA_HPC_TRACE=1`；必须出现 all-decode strict、HPC HIT 和生产 YaRN scale，且不允许 fallback；启用 chunked prefill 时还要求 mixed-split 证据 |
+| `gqa-hpc` | `DeepseekV3GQLAHPCForCausalLM` | 真实 GQA cache；所有 decode 使用 HPC-Ops adaptive static split-K；纯 prefill 使用 DiffKV，混合 batch 只把 prefill 后缀交给 DiffKV | server 继承 `GQLA_HPC_STRICT=1`、`GQLA_HPC_TRACE=1`；必须出现 all-decode strict、`splitk=adaptive_static`、HPC HIT 和生产 YaRN scale，且不允许 fallback；启用 chunked prefill 时还要求 mixed-split 证据 |
 | `mqa-mla` | `DeepseekV3GQLAForCausalLM` | 上游 MLA absorb / latent MQA cache control | 清除两个 HPC 环境变量；server log 不允许出现 HPC HIT |
 
 仅仅成功加载 GQA architecture 或只出现一次 HIT 都不足以证明所有 decode 使用了
-HPC-Ops。backend 必须先打印 `GQLA_HPC_ALL_DECODE_STRICT_ENABLED`；混合调度时还会打印
+HPC-Ops。backend 必须先打印 `GQLA_HPC_ALL_DECODE_STRICT_ENABLED`；首次真实 kernel
+命中还必须带有 `splitk=adaptive_static`，证明 vLLM 没有关闭 split-K；混合调度时还会打印
 `GQLA_HPC_TRACE_MIXED_SPLIT`。HIT 是 `hpc.attention_decode_bf16` 实际返回后打印的。
 strict 模式保证任意 decode 布局不满足 HPC ABI、扩展导入失败或 kernel 调用失败时
 立即终止 case，而不是把该 batch 静默交回 DiffKV。
@@ -179,6 +180,6 @@ process group；脚本只保存并操作这个精确的 PGID：
 - GQA 与 MLA 的 KV cache 大小不同；这正是所比较架构的一部分，但会导致可容纳的
   batch/context 上限不同。
 - 各 TP case 都重启模型，因此不共享 CUDA graph、allocator 或 prefix cache 状态。
-- 只有 GQLA 的 `verification.txt` 为 `verified_all_decode_hpc`、MLA control 为
+- 只有 GQLA 的 `verification.txt` 为 `verified_all_decode_hpc_splitk`、MLA control 为
   `verified_no_hpc_hit`，且 matrix 最终打印
   `DSV3P1_G8_VLLM_BENCHMARK_MATRIX_OK` 的 case 才应进入汇总表。

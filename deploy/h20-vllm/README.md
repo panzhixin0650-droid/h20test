@@ -35,8 +35,8 @@ compatibility workaround:
    and other large wheels from official PyPI metadata and gives every wheel at
    least 32 MiB to aria2. uv installs the remaining dependency closure
    concurrently. The script then deploys the GQLA/HPC sources embedded in this
-   GitHub relay, applies the runtime `softmax_scale` patch, and builds HPC-Ops
-   against the exact Torch ABI.
+   GitHub relay, verifies the exact source containing runtime `softmax_scale`
+   and adaptive split-K, and builds HPC-Ops against the exact Torch ABI.
 2. `run_h20_tp8_benchmark.sh` runs exactly one fresh-server case. The route is
    `mla` or `gqla`; the profile is `2k`, `8k`, `16k`, or `16k-b20`.
 
@@ -84,49 +84,69 @@ benchmark launchers. It does **not** contain or modify the converted model.
 The deployment script checks that the converted checkpoint is already at:
 
 ```text
-/mnt/tidalfs-alwl01/task/236362/GQLA/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract
+/mnt/public03/task/236362/GQLA/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract
 ```
 
 It copies the bundled plugin to `GQLA/code/GQLA_preprint` and unpacks a
-SHA256-verified HPC-Ops source archive at local revision `f85ce84`. That source
-contains both local commits required by this integration:
+SHA256-verified HPC-Ops source archive at local revision `de202c9`. That source
+contains all three local commits required by this integration:
 
 - `83165c3`: GQLA QK192/V128 BF16 decode support, based on Tencent `1cd3329`.
 - `f85ce84`: runtime softmax scale and build/bootstrap fixes.
+- `de202c9`: adaptive static split-K for small-batch GQLA decode.
 
 The archive contains source only—no wheel, build tree, or model data. Keeping
-the exact 4 MB source archive in this transit branch avoids depending on a
+the exact source archive in this transit branch avoids depending on a
 local-only commit that Tencent GitHub cannot serve.
 
 ## Clone and deploy
 
-Run on the H20 machine:
+Run on the H20 machine. Clone the split-K relay beside the existing checkout so
+an older or locally modified `/root/h20test` is not overwritten:
 
 ```bash
-mkdir -p /mnt/tidalfs-alwl01/task/236362/GQLA/code
-cd /mnt/tidalfs-alwl01/task/236362/GQLA/code
+R='/mnt/public03/task/236362/GQLA'
+RELAY='/root/h20test-splitk-20260818'
+BRANCH='deploy/h20-vllm-splitk-20260818'
 
-git clone --branch deploy/h20-vllm-20260815 --single-branch \
-  https://github.com/panzhixin0650-droid/h20test.git h20test
+git clone --branch "$BRANCH" --single-branch \
+  https://github.com/panzhixin0650-droid/h20test.git \
+  "$RELAY"
+```
 
-bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
+Keep the previous HPC-Ops tree as a rollback source and materialize `de202c9`
+at a new path. The generated runtime records this new path, so no old source is
+silently reused:
+
+```bash
+R='/mnt/public03/task/236362/GQLA'
+RELAY='/root/h20test-splitk-20260818'
+MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
+HPC_NEW="$R/code/hpc-ops-de202c9"
+
+GQLA_ROOT="$R" \
+MODEL_DIR="$MODEL" \
+HPC_OPS_DIR="$HPC_NEW" \
+FORCE_HPC_REBUILD=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/setup_h20_cu129_env.sh"
 ```
 
 If the machine's Git/GnuTLS client cannot complete a GitHub TLS handshake,
 download the same branch through GitHub codeload instead:
 
 ```bash
-mkdir -p /mnt/tidalfs-alwl01/task/236362/GQLA/code/h20test
-cd /mnt/tidalfs-alwl01/task/236362/GQLA/code
+RELAY='/root/h20test-splitk-20260818'
+BRANCH='deploy/h20-vllm-splitk-20260818'
+
+mkdir -p "$RELAY"
 
 curl -fL --retry 10 --retry-delay 2 --connect-timeout 30 \
-  -o /tmp/h20test-h20-vllm.tar.gz \
-  'https://codeload.github.com/panzhixin0650-droid/h20test/tar.gz/refs/heads/deploy/h20-vllm-20260815'
+  -o /tmp/h20test-splitk.tar.gz \
+  "https://codeload.github.com/panzhixin0650-droid/h20test/tar.gz/refs/heads/$BRANCH"
 
-tar -xzf /tmp/h20test-h20-vllm.tar.gz \
-  --strip-components=1 -C h20test
-
-bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
+tar -xzf /tmp/h20test-splitk.tar.gz \
+  --strip-components=1 -C "$RELAY"
 ```
 
 The H20 deployment no longer needs a second GitHub request for HPC-Ops: its
@@ -143,18 +163,36 @@ requires no GitHub Releases download.
 Deploy and immediately create/check the environment in one command:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 RUN_INSTALL=1 \
-  bash h20test/deploy/h20-vllm/deploy_h20_vllm.sh
+R='/mnt/public03/task/236362/GQLA'
+RELAY='/root/h20test-splitk-20260818'
+MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
+HPC_NEW="$R/code/hpc-ops-de202c9"
+
+GQLA_ROOT="$R" MODEL_DIR="$MODEL" HPC_OPS_DIR="$HPC_NEW" \
+FORCE_HPC_REBUILD=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/setup_h20_cu129_env.sh"
 ```
 
-The environment is installed with `uv` under
-`/mnt/tidalfs-alwl01/task/236362/GQLA/envs/venv-py312`. Re-running the command
-reuses the environment, wheel cache, source tree, and compiled HPC wheel.
-When a copied CUDA 13 Torch environment meets an H20 DLC host driver that still
-reports CUDA 12.x, bootstrap downloads the SHA256-pinned 62 MiB NVIDIA
-`cuda-compat-13-0` package and extracts it below `GQLA/envs`. The host driver is
-not modified, and the already-installed Torch/vLLM and compiled HPC wheel are
-reused.
+The clean CUDA 12.9 environment is installed with `uv` under
+`/mnt/public03/task/236362/GQLA/envs/h20-cu129-py312`. Re-running the command
+reuses downloaded wheels and rebuilds HPC-Ops only when requested or when the
+source fingerprint differs. It does not modify the converted checkpoint.
+
+Run the three GQLA C=64 cases separately after setup:
+
+```bash
+R='/mnt/public03/task/236362/GQLA'
+RELAY='/root/h20test-splitk-20260818'
+
+GQLA_ROOT="$R" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/run_h20_tp8_benchmark.sh" gqla 2k
+
+GQLA_ROOT="$R" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/run_h20_tp8_benchmark.sh" gqla 8k
+
+GQLA_ROOT="$R" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/run_h20_tp8_benchmark.sh" gqla 16k
+```
 
 ## Benchmark after install
 

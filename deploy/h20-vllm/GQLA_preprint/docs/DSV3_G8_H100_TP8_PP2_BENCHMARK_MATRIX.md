@@ -120,9 +120,10 @@ MLA case 必须解析为 `DeepseekV3GQLAForCausalLM`，日志必须选择
 GQLA case 在 head 和远端 worker 上都显式设置 `GQLA_HPC_STRICT=1` 和
 `GQLA_HPC_TRACE=1`，架构必须解析为 `DeepseekV3GQLAHPCForCausalLM`。正式请求结束后，
 脚本要求 `GQLA_HPC_ALL_DECODE_STRICT_ENABLED`、至少一个
-`GQLA_HPC_TRACE_HIT`、chunked-prefill 下的 `GQLA_HPC_TRACE_MIXED_SPLIT`、零 fallback，
+带 `splitk=adaptive_static` 的 `GQLA_HPC_TRACE_HIT`、chunked-prefill 下的
+`GQLA_HPC_TRACE_MIXED_SPLIT`、零 fallback，
 并要求日志中的 YaRN `softmax_scale` 命中 `0.135233...`；否则 case 退出失败，不能写
-`status=verified_all_decode_hpc`。
+`status=verified_all_decode_hpc_splitk`。
 
 GQLA 的纯 prefill 走 FlashAttention DiffKV。混合 batch 被拆成 decode 前缀和 prefill
 后缀：前者必须走 HPC-Ops，只有后者走 DiffKV。因此长输入比较时 TTFT 主要反映

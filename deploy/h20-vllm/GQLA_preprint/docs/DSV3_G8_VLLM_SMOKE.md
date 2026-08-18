@@ -111,10 +111,12 @@ The shell driver captures all worker output and enforces:
 2. the GQA log contains `GQLA_HPC_ALL_DECODE_STRICT_ENABLED`;
 3. the mixed regression run contains `GQLA_HPC_TRACE_MIXED_SPLIT`;
 4. the GQA log contains `GQLA_HPC_TRACE_HIT`;
-5. the same GQA trace reports `softmax_scale=0.135233...`, proving production
+5. the same hit reports `splitk=adaptive_static`, proving vLLM enabled the
+   optimized HPC-Ops split-K policy;
+6. the same GQA trace reports `softmax_scale=0.135233...`, proving production
    YaRN scaling rather than the unscaled `0.0721688...` value;
-6. the GQA log does not contain `GQLA_HPC_TRACE_FALLBACK`;
-7. the MQA/MLA control log contains none of the HPC routing markers.
+7. the GQA log does not contain `GQLA_HPC_TRACE_FALLBACK`;
+8. the MQA/MLA control log contains none of the HPC routing markers.
 
 If the backend uses different stable markers, override only the verification
 patterns:
@@ -125,6 +127,7 @@ HPC_FALLBACK_PATTERN='your-fallback-regex' \
 HPC_SCALE_PATTERN='your-softmax-scale-regex' \
 HPC_ALL_DECODE_PATTERN='your-all-decode-contract-regex' \
 HPC_MIXED_SPLIT_PATTERN='your-mixed-split-regex' \
+HPC_ADAPTIVE_SPLITK_PATTERN='your-adaptive-splitk-regex' \
 bash scripts/run_dsv3p1_g8_vllm_smoke.sh
 ```
 

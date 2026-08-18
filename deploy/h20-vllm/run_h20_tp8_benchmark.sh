@@ -43,6 +43,52 @@ sanitize_cuda13_compat() {
     export LD_LIBRARY_PATH=$cleaned
 }
 
+hpc_source_hash() {
+    find \
+        "$HPC_OPS_DIR/CMakeLists.txt" \
+        "$HPC_OPS_DIR/setup.py" \
+        "$HPC_OPS_DIR/hpc" \
+        "$HPC_OPS_DIR/src" \
+        "$HPC_OPS_DIR/3rd/cutlass/include" \
+        -type f ! -name '*.pyc' ! -path "$HPC_OPS_DIR/hpc/version.py" -print0 \
+        | sort -z \
+        | xargs -0 sha256sum \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
+validate_gqla_splitk_runtime() {
+    local expected_commit=de202c9bda942fdfd499d09e51ea6ff9c89c5d50
+    local current_commit current_hash installed_hash backend
+
+    current_commit=$(git -C "$HPC_OPS_DIR" rev-parse HEAD 2>/dev/null || true)
+    if [[ -z "$current_commit" && -f "$HPC_OPS_DIR/.gqla_hpc_source_commit" ]]; then
+        current_commit=$(<"$HPC_OPS_DIR/.gqla_hpc_source_commit")
+    fi
+    [[ "$current_commit" == "$expected_commit" ]] \
+        || die "HPC-Ops source is $current_commit; expected adaptive split-K $expected_commit"
+
+    current_hash=$(hpc_source_hash)
+    [[ -f "$VENV_DIR/.hpc-source.sha256" ]] \
+        || die "installed HPC-Ops source fingerprint is missing: $VENV_DIR/.hpc-source.sha256"
+    installed_hash=$(<"$VENV_DIR/.hpc-source.sha256")
+    [[ "$installed_hash" == "$current_hash" ]] \
+        || die "installed HPC-Ops hash $installed_hash does not match source $current_hash; rerun setup with FORCE_HPC_REBUILD=1"
+
+    backend=$GQLA_REPO/src/vllm_hpc_gqa_backend.py
+    [[ -f "$backend" ]] && grep -Fq 'splitk=True' "$backend" \
+        || die "vLLM GQLA backend does not enable adaptive split-K: $backend"
+    "$PYTHON" - <<'PY'
+import hpc
+import torch
+
+schema = str(torch.ops.hpc.attention_decode_bf16.default._schema)
+assert "use_splitk" in schema, schema
+assert "softmax_scale" in schema, schema
+print(f"H20_GQLA_SPLITK_PREFLIGHT_OK hpc={hpc.__version__} schema={schema}")
+PY
+}
+
 GQLA_ROOT=${GQLA_ROOT:-$(infer_gqla_root)}
 VENV_DIR=${VENV_DIR:-$GQLA_ROOT/envs/h20-cu129-py312}
 RUNTIME_ENV_FILE=${RUNTIME_ENV_FILE:-$VENV_DIR/h20-runtime.env}
@@ -75,6 +121,10 @@ case "$ROUTE" in
         ;;
     *) die "route must be mla or gqla; got $ROUTE" ;;
 esac
+
+if [[ "$path_name" == gqa-hpc ]]; then
+    validate_gqla_splitk_runtime
+fi
 
 case "$PROFILE" in
     2k)

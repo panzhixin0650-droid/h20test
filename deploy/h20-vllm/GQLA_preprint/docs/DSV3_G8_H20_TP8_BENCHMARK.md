@@ -200,7 +200,7 @@ bash scripts/benchmark_dsv3p1_g8_h20_tp8.sh
         └── ...
 ```
 
-GQLA 的 `verification.txt` 必须写出 `status=verified_all_decode_hpc`，不能再用旧版的
+GQLA 的 `verification.txt` 必须写出 `status=verified_all_decode_hpc_splitk`，不能再用旧版的
 “至少一次 HIT”作为完整路由证据。只有两个 `verification.txt` 分别通过 MLA backend
 和 GQLA/HPC all-decode trace 校验，并且最终
 打印 `DSV3P1_G8_VLLM_BENCHMARK_MATRIX_OK`，这一组结果才算完整有效。启动和 checkpoint

@@ -276,6 +276,55 @@ class DeepseekV3GQLAStructureTest(unittest.TestCase):
         torch.testing.assert_close(output[2:], torch.full_like(output[2:], 9))
         self.assertEqual(parent_calls, [(4, prefill_metadata)])
 
+    def test_hpc_decode_enables_adaptive_static_splitk(self) -> None:
+        impl = object.__new__(GQLAHPCFlashAttentionDiffKVImpl)
+        impl._gqla_hpc_strict = True
+        impl._gqla_hpc_trace = False
+        impl.head_size = 192
+        impl.scale = 0.125
+
+        query = torch.zeros(2, 16, 192, dtype=torch.bfloat16)
+        kv_cache = torch.zeros(3, 64, 1, 320, dtype=torch.bfloat16)
+        output = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
+        metadata = SimpleNamespace(
+            num_actual_tokens=2,
+            block_table=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens=torch.ones(2, dtype=torch.int32),
+        )
+        call_kwargs = {}
+
+        def fake_hpc(*args, **kwargs):
+            del args
+            call_kwargs.update(kwargs)
+            return kwargs["output"]
+
+        with (
+            patch.object(impl, "_contract_failure", return_value=None),
+            patch(
+                "src.vllm_hpc_gqa_backend._load_hpc_attention",
+                return_value=fake_hpc,
+            ),
+        ):
+            used_hpc = impl._run_hpc_decode(
+                query,
+                kv_cache,
+                metadata,
+                output,
+                None,
+                None,
+                batch=2,
+                query_len=1,
+                mixed=False,
+            )
+
+        self.assertTrue(used_hpc)
+        self.assertIs(call_kwargs["splitk"], True)
+        self.assertIsNone(call_kwargs["task_map"])
+        self.assertIsNone(call_kwargs["split_flag"])
+        self.assertEqual(call_kwargs["output"].data_ptr(), output.data_ptr())
+        self.assertEqual(call_kwargs["output"].shape, output.shape)
+        self.assertEqual(call_kwargs["softmax_scale"], 0.125)
+
     def test_env_switches_are_explicit(self) -> None:
         with patch.dict(os.environ, {"GQLA_HPC_TRACE": "YeS"}, clear=False):
             self.assertTrue(_env_enabled("GQLA_HPC_TRACE"))

@@ -26,6 +26,7 @@ HPC_FALLBACK_PATTERN=${HPC_FALLBACK_PATTERN:-GQLA_HPC_TRACE_FALLBACK}
 HPC_SCALE_PATTERN=${HPC_SCALE_PATTERN:-softmax_scale=0\\.135233}
 HPC_ALL_DECODE_PATTERN=${HPC_ALL_DECODE_PATTERN:-GQLA_HPC_ALL_DECODE_STRICT_ENABLED}
 HPC_MIXED_SPLIT_PATTERN=${HPC_MIXED_SPLIT_PATTERN:-GQLA_HPC_TRACE_MIXED_SPLIT}
+HPC_ADAPTIVE_SPLITK_PATTERN=${HPC_ADAPTIVE_SPLITK_PATTERN:-splitk=adaptive_static}
 
 for pair in \
     "VERIFY_HPC_TRACE:$VERIFY_HPC_TRACE" \
@@ -128,6 +129,10 @@ for path in "${path_values[@]}"; do
             fi
             if ! grep -Eq -- "$HPC_ALL_DECODE_PATTERN" "$log"; then
                 echo "all-decode HPC strict proof missing for path=$path tp=$tp; log=$log" >&2
+                exit 1
+            fi
+            if ! grep -Eq -- "$HPC_ADAPTIVE_SPLITK_PATTERN" "$log"; then
+                echo "adaptive static split-K proof missing for path=$path tp=$tp; log=$log" >&2
                 exit 1
             fi
             if [[ "$VERIFY_HPC_MIXED_SPLIT" == 1 ]] \

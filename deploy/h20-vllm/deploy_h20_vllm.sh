@@ -8,8 +8,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 BUNDLE_DIR="$SCRIPT_DIR/GQLA_preprint"
 PATCH_FILE="$REPO_ROOT/patches/0001-Add-runtime-attention-scale-for-GQLA-serving.patch"
-HPC_BUNDLE_ARCHIVE="$SCRIPT_DIR/hpc-ops-f85ce84.tar.gz"
-HPC_BUNDLE_SHA256=dd5a668ee454683a81d8857988e4285e9c1558d39cec92664c981e7b8c562e7e
+HPC_BUNDLE_ARCHIVE="$SCRIPT_DIR/hpc-ops-de202c9.tar.gz"
+HPC_BUNDLE_SHA256=7477755669ed5ef66a346de5ed40c977de636be8aacfe0db7f1f99c83e9149f3
 UV_BUNDLE_ARCHIVE="$SCRIPT_DIR/uv-0.9.3-x86_64-unknown-linux-gnu.xz"
 UV_BUNDLE_SHA256=dd572805f351a07266ba464a15fe134dbb32e082f048bae13e4f8f991e2b7b69
 UV_BINARY_SHA256=d7198eb91c8b6a7ead6eb5b2e7aca159124695c8783ff2df708f6864bc574bbf
@@ -25,7 +25,7 @@ GQLA_DST=${GQLA_DST:-$CODE_ROOT/GQLA_preprint}
 HPC_DST=${HPC_DST:-$CODE_ROOT/hpc-ops}
 HPC_REMOTE=${HPC_REMOTE:-https://github.com/Tencent/hpc-ops.git}
 HPC_BASE_COMMIT=83165c3f7d1f2a4aa0bd1f8c0f37fab771b5190b
-HPC_SOURCE_COMMIT=f85ce8457ce6ef46c4c89736576792f14533cc48
+HPC_SOURCE_COMMIT=de202c9bda942fdfd499d09e51ea6ff9c89c5d50
 HPC_ARCHIVE_URL=${HPC_ARCHIVE_URL:-https://codeload.github.com/Tencent/hpc-ops/tar.gz/$HPC_BASE_COMMIT}
 RUN_INSTALL=${RUN_INSTALL:-0}
 
@@ -40,6 +40,8 @@ die() {
   die "converted model index is missing: $MODEL_DIR/model.safetensors.index.json"
 [[ -f "$BUNDLE_DIR/pyproject.toml" ]] || die "incomplete GQLA source bundle"
 [[ -f "$PATCH_FILE" ]] || die "HPC-Ops patch is missing: $PATCH_FILE"
+[[ -f "$HPC_BUNDLE_ARCHIVE" ]] || \
+  die "exact adaptive split-K HPC-Ops archive is missing: $HPC_BUNDLE_ARCHIVE"
 command -v git >/dev/null 2>&1 || die "git is required"
 
 mkdir -p "$CODE_ROOT" "$GQLA_DST"
@@ -154,32 +156,25 @@ if [[ ! -d "$HPC_DST/.git" ]]; then
   echo "[deploy] HPC-Ops baseline -> $HPC_DST"
 fi
 
-if git -C "$HPC_DST" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
-  echo "[deploy] HPC-Ops GQLA runtime-scale patch is already applied"
-else
-  hpc_base_ok=0
-  current_commit=$(git -C "$HPC_DST" rev-parse --verify HEAD 2>/dev/null || true)
-  if [[ "$current_commit" == "$HPC_BASE_COMMIT" ]]; then
-    hpc_base_ok=1
-  elif [[ -f "$HPC_DST/.gqla_hpc_base_commit" ]] && \
-       [[ "$(<"$HPC_DST/.gqla_hpc_base_commit")" == "$HPC_BASE_COMMIT" ]]; then
-    hpc_base_ok=1
-  fi
-  [[ "$hpc_base_ok" == "1" ]] || \
-    die "HPC-Ops is not the expected pinned source $HPC_BASE_COMMIT"
-  [[ -z "$(git -C "$HPC_DST" status --porcelain --untracked-files=no)" ]] || \
-    die "HPC-Ops has tracked local changes; refusing to overwrite them"
-  git -C "$HPC_DST" apply --check "$PATCH_FILE"
-  git -C "$HPC_DST" apply "$PATCH_FILE"
-  echo "[deploy] applied HPC-Ops GQLA runtime-scale patch"
+hpc_source_ok=0
+current_commit=$(git -C "$HPC_DST" rev-parse --verify HEAD 2>/dev/null || true)
+if [[ "$current_commit" == "$HPC_SOURCE_COMMIT" ]]; then
+  hpc_source_ok=1
+elif [[ -f "$HPC_DST/.gqla_hpc_source_commit" ]] && \
+     [[ "$(<"$HPC_DST/.gqla_hpc_source_commit")" == "$HPC_SOURCE_COMMIT" ]]; then
+  hpc_source_ok=1
 fi
+[[ "$hpc_source_ok" == "1" ]] || \
+  die "existing HPC-Ops is not exact adaptive split-K source $HPC_SOURCE_COMMIT"
+
+echo "[deploy] verified exact HPC-Ops source with runtime scale and adaptive split-K"
 
 cat >"$CODE_ROOT/H20_VLLM_DEPLOYMENT.txt" <<EOF
 GQLA source: $GQLA_DST
 HPC-Ops source: $HPC_DST
 HPC-Ops base: $HPC_BASE_COMMIT
 HPC-Ops source revision: $HPC_SOURCE_COMMIT
-HPC-Ops patch: $(basename "$PATCH_FILE")
+HPC-Ops included patch: $(basename "$PATCH_FILE")
 Converted model: $MODEL_DIR
 EOF
 

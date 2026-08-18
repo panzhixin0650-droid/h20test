@@ -21,6 +21,10 @@ Runtime controls:
     Guarantee the all-decode contract. Any decode-layout, extension-import, or
     kernel-call failure aborts instead of falling back to DiffKV. Pure prefill
     remains on DiffKV by design.
+
+Every eligible decode call enables HPC-Ops' adaptive static split-K policy.
+The kernel chooses its concrete split count from the rank-local batch, KV-head
+count, context capacity, and SM count.
 """
 
 from __future__ import annotations
@@ -557,7 +561,7 @@ class GQLAHPCFlashAttentionDiffKVImpl(FlashAttentionDiffKVImpl):
                 attn_metadata.seq_lens,
                 mtp=query_len - 1,
                 new_kv_included=True,
-                splitk=False,
+                splitk=True,
                 task_map=None,
                 split_flag=None,
                 output=output_view,
@@ -575,6 +579,7 @@ class GQLAHPCFlashAttentionDiffKVImpl(FlashAttentionDiffKVImpl):
                 f"mode={'mixed' if mixed else 'uniform'} "
                 f"batch={batch} qlen={query_len} "
                 f"hq={self.num_heads} hkv={self.num_kv_heads} "
+                "splitk=adaptive_static "
                 f"softmax_scale={float(self.scale):.9g}",
                 flush=True,
             )
