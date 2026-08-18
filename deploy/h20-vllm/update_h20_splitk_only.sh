@@ -96,7 +96,7 @@ PY
 }
 
 find_cuda_toolkit() {
-    local candidate release
+    local candidate release tool_dir
     local -a candidates=()
 
     [[ -n "${CUDA_HOME:-}" ]] && candidates+=("$CUDA_HOME")
@@ -120,9 +120,28 @@ PY
 )
 
     for candidate in "${candidates[@]}"; do
-        [[ -x "$candidate/bin/nvcc" && -f "$candidate/include/cuda.h" ]] || continue
+        [[ -f "$candidate/bin/nvcc" && -f "$candidate/include/cuda.h" ]] || continue
+        if [[ ! -x "$candidate/bin/nvcc" ]]; then
+            [[ -n "$NONEXECUTABLE_NVCC" ]] || NONEXECUTABLE_NVCC=$candidate/bin/nvcc
+            if [[ "$PREFLIGHT_ONLY" == 0 && "$REPAIR_TOOL_EXEC_BITS" == 1 ]]; then
+                chmod u+x "$candidate/bin/nvcc" 2>/dev/null || true
+                for tool_dir in "$candidate/bin" "$candidate/nvvm/bin"; do
+                    [[ -d "$tool_dir" ]] || continue
+                    find "$tool_dir" -maxdepth 1 -type f -exec chmod u+x {} + 2>/dev/null || true
+                done
+                if [[ -x "$candidate/bin/nvcc" ]]; then
+                    CUDA_TOOL_EXEC_BITS_REPAIRED=1
+                    echo "[hpc-only] restored CUDA compiler executable bits under $candidate"
+                else
+                    continue
+                fi
+            else
+                continue
+            fi
+        fi
         release=$("$candidate/bin/nvcc" --version 2>/dev/null \
-            | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1)
+            | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1) \
+            || continue
         if [[ -n "$release" ]] \
             && version_ge "$release" 12.8 \
             && [[ "${release%%.*}" == "$TORCH_CUDA_MAJOR" ]]; then
@@ -142,6 +161,11 @@ find_cuda_cudart() {
         "$CUDA_TOOLKIT_ROOT/lib/libcudart.so"
         "$CUDA_TOOLKIT_ROOT/lib64/libcudart.so"
     )
+    for candidate in \
+        "$CUDA_TOOLKIT_ROOT"/lib/libcudart.so."$TORCH_CUDA_MAJOR"* \
+        "$CUDA_TOOLKIT_ROOT"/lib64/libcudart.so."$TORCH_CUDA_MAJOR"*; do
+        [[ -f "$candidate" ]] && candidates+=("$candidate")
+    done
     while IFS= read -r candidate; do
         [[ -n "$candidate" ]] && candidates+=("$candidate")
     done < <("$PYTHON" - "$TORCH_CUDA_MAJOR" <<'PY'
@@ -193,16 +217,32 @@ GQLA_REPO=${GQLA_REPO:-$CODE_ROOT/GQLA_preprint}
 HPC_OPS_DIR=${HPC_OPS_DIR:-$CODE_ROOT/hpc-ops-de202c9}
 MAX_JOBS=${MAX_JOBS:-16}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
+REPAIR_TOOL_EXEC_BITS=${REPAIR_TOOL_EXEC_BITS:-1}
+ALLOW_CCCL_MINOR_MISMATCH=${ALLOW_CCCL_MINOR_MISMATCH:-1}
 requested_venv=${VENV_DIR:-}
 requested_runtime=${RUNTIME_ENV_FILE:-}
 
 [[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]] || die "MAX_JOBS must be a positive integer"
 [[ "$PREFLIGHT_ONLY" == 0 || "$PREFLIGHT_ONLY" == 1 ]] \
     || die "PREFLIGHT_ONLY must be 0 or 1"
+[[ "$REPAIR_TOOL_EXEC_BITS" == 0 || "$REPAIR_TOOL_EXEC_BITS" == 1 ]] \
+    || die "REPAIR_TOOL_EXEC_BITS must be 0 or 1"
+[[ "$ALLOW_CCCL_MINOR_MISMATCH" == 0 || "$ALLOW_CCCL_MINOR_MISMATCH" == 1 ]] \
+    || die "ALLOW_CCCL_MINOR_MISMATCH must be 0 or 1"
 [[ -f "$DEPLOY_SCRIPT" ]] || die "deployment helper is missing: $DEPLOY_SCRIPT"
 [[ -f "$MODEL_DIR/config.json" ]] || die "converted model is missing: $MODEL_DIR/config.json"
 [[ -f "$MODEL_DIR/model.safetensors.index.json" ]] \
     || die "converted model index is missing: $MODEL_DIR/model.safetensors.index.json"
+
+if [[ -z "$requested_venv" && -n "$requested_runtime" ]]; then
+    runtime_parent=$(cd -- "$(dirname -- "$requested_runtime")" 2>/dev/null && pwd -P || true)
+    if [[ -n "$runtime_parent" && -x "$runtime_parent/bin/python" ]]; then
+        requested_venv=$runtime_parent
+        echo "[hpc-only] inferred VENV_DIR=$requested_venv from RUNTIME_ENV_FILE"
+    else
+        die "RUNTIME_ENV_FILE was provided without VENV_DIR and is not inside a Python venv; provide both paths"
+    fi
+fi
 
 selected_venv=
 if [[ -n "$requested_venv" ]]; then
@@ -306,16 +346,49 @@ fi
 
 CUDA_TOOLKIT_ROOT=
 CUDA_TOOLKIT_VERSION=
-find_cuda_toolkit \
-    || die "existing runtime does not expose nvcc >=12.8 matching torch CUDA $TORCH_CUDA_VERSION"
+NONEXECUTABLE_NVCC=
+CUDA_TOOL_EXEC_BITS_REPAIRED=0
+if ! find_cuda_toolkit; then
+    if [[ -n "$NONEXECUTABLE_NVCC" ]]; then
+        if [[ "$PREFLIGHT_ONLY" == 1 && "$REPAIR_TOOL_EXEC_BITS" == 1 ]]; then
+            die "CUDA compiler is present but not executable: $NONEXECUTABLE_NVCC; preflight is read-only, and the actual update can restore its transferred executable bits"
+        fi
+        die "CUDA compiler is present but cannot execute: $NONEXECUTABLE_NVCC (check permissions and noexec mounts)"
+    fi
+    die "existing runtime does not expose nvcc >=12.8 matching torch CUDA $TORCH_CUDA_VERSION"
+fi
 echo "[hpc-only] CUDA toolkit=$CUDA_TOOLKIT_ROOT version=$CUDA_TOOLKIT_VERSION"
+
+CUDA_HEADER_VERSION_CODE=$(sed -n \
+    's/^[[:space:]]*#[[:space:]]*define[[:space:]][[:space:]]*CUDA_VERSION[[:space:]][[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+    "$CUDA_TOOLKIT_ROOT/include/cuda.h" | head -n1)
+[[ "$CUDA_HEADER_VERSION_CODE" =~ ^[0-9]+$ ]] \
+    || die "cannot read CUDA_VERSION from $CUDA_TOOLKIT_ROOT/include/cuda.h"
+CUDA_HEADER_MAJOR=$((CUDA_HEADER_VERSION_CODE / 1000))
+CUDA_HEADER_MINOR=$(((CUDA_HEADER_VERSION_CODE % 1000) / 10))
+CUDA_HEADER_VERSION=$CUDA_HEADER_MAJOR.$CUDA_HEADER_MINOR
+CUDA_COMPILER_MAJOR=${CUDA_TOOLKIT_VERSION%%.*}
+cuda_compiler_tail=${CUDA_TOOLKIT_VERSION#*.}
+CUDA_COMPILER_MINOR=${cuda_compiler_tail%%.*}
+[[ "$CUDA_HEADER_MAJOR" == "$CUDA_COMPILER_MAJOR" ]] \
+    || die "CUDA compiler $CUDA_TOOLKIT_VERSION and headers $CUDA_HEADER_VERSION have different majors"
+[[ "$CUDA_HEADER_MAJOR" == "$TORCH_CUDA_MAJOR" ]] \
+    || die "CUDA headers $CUDA_HEADER_VERSION do not match torch CUDA major $TORCH_CUDA_MAJOR"
+
+CCCL_COMPAT_OVERRIDE=0
+if [[ "$CUDA_HEADER_MINOR" != "$CUDA_COMPILER_MINOR" ]]; then
+    [[ "$ALLOW_CCCL_MINOR_MISMATCH" == 1 ]] \
+        || die "CUDA compiler $CUDA_TOOLKIT_VERSION and headers $CUDA_HEADER_VERSION differ; set ALLOW_CCCL_MINOR_MISMATCH=1 only for a verified same-major toolkit"
+    CCCL_COMPAT_OVERRIDE=1
+    echo "[hpc-only] CUDA compiler=$CUDA_TOOLKIT_VERSION headers=$CUDA_HEADER_VERSION; enabling the CCCL same-major compatibility override for this build"
+fi
 CUDA_CUDART_LIBRARY=
 find_cuda_cudart \
     || die "existing runtime does not expose libcudart for CUDA major $TORCH_CUDA_MAJOR"
 echo "[hpc-only] CUDA runtime=$CUDA_CUDART_LIBRARY"
 
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
-    echo "H20_SPLITK_PREFLIGHT_OK venv=$VENV_DIR runtime_env=$BASE_RUNTIME_ENV_FILE torch_cuda=$TORCH_CUDA_VERSION cuda_toolkit=$CUDA_TOOLKIT_ROOT cudart=$CUDA_CUDART_LIBRARY"
+    echo "H20_SPLITK_PREFLIGHT_OK venv=$VENV_DIR runtime_env=$BASE_RUNTIME_ENV_FILE torch_cuda=$TORCH_CUDA_VERSION cuda_toolkit=$CUDA_TOOLKIT_ROOT cuda_compiler=$CUDA_TOOLKIT_VERSION cuda_headers=$CUDA_HEADER_VERSION cccl_compat_override=$CCCL_COMPAT_OVERRIDE cudart=$CUDA_CUDART_LIBRARY"
     exit 0
 fi
 
@@ -372,6 +445,15 @@ export CMAKE_PREFIX_PATH="$("$PYTHON" -c 'import torch; print(torch.utils.cmake_
 export CMAKE_GENERATOR=Ninja
 export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
 export MAX_JOBS
+if [[ "$CCCL_COMPAT_OVERRIDE" == 1 ]]; then
+    cccl_compat_define=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK
+    if [[ " ${NVCC_PREPEND_FLAGS:-} " != *" $cccl_compat_define "* ]]; then
+        export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:+$NVCC_PREPEND_FLAGS }$cccl_compat_define"
+    fi
+    if [[ " ${CXXFLAGS:-} " != *" $cccl_compat_define "* ]]; then
+        export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$cccl_compat_define"
+    fi
+fi
 
 source_hash=$(hpc_source_hash)
 build_root=$(mktemp -d /tmp/gqla-hpc-splitk-build.XXXXXX)
@@ -474,8 +556,16 @@ venv_dir=$VENV_DIR
 python=$PYTHON
 torch_cuda=$($PYTHON -c 'import torch; print(torch.version.cuda)')
 cuda_toolkit=$CUDA_TOOLKIT_ROOT
+cuda_compiler=$CUDA_TOOLKIT_ROOT/bin/nvcc
+cuda_compiler_version=$CUDA_TOOLKIT_VERSION
+cuda_header_version=$CUDA_HEADER_VERSION
 cudart_library=$CUDA_CUDART_LIBRARY
 cudart_link_dir=$cudart_link_dir
+ld_library_path=$(printf '%q' "${LD_LIBRARY_PATH:-}")
+cuda_tool_exec_bits_repaired=$CUDA_TOOL_EXEC_BITS_REPAIRED
+cccl_compat_override=$CCCL_COMPAT_OVERRIDE
+nvcc_prepend_flags=$(printf '%q' "${NVCC_PREPEND_FLAGS:-}")
+cxxflags=$(printf '%q' "${CXXFLAGS:-}")
 hpc_source_commit=$EXPECTED_HPC_COMMIT
 hpc_source_hash=$source_hash
 hpc_wheel=$installed_wheel

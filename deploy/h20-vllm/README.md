@@ -161,12 +161,22 @@ stack, transfer the environment or wheel bundle through a verified OSS prefix;
 do not put Python, uv, CUDA wheels, or a venv in this Git branch.
 
 For a split-K source refresh on a machine that already ran vLLM, use the
-HPC-only updater. It prefers `venv-py312`, then `h20-new`, then
-`h20-cu129-py312`, and accepts an existing serving stack only when it has Torch
-2.11 with CUDA 12.9 or 13.0, vLLM 0.22.1, Transformers 5.12.1, a working
-`h20-runtime.env`, and eight SM90 GPUs. It preserves that runtime's CUDA
-forward-compatibility setup, uses no-index/no-deps local installs, and has no
-dependency-download path.
+HPC-only updater. Always pass the serving venv and the runtime wrapper that
+actually makes CUDA initialize. The updater accepts the stack only when it has
+Torch 2.11 with CUDA 12.9 or 13.0, vLLM 0.22.1, Transformers 5.12.1, and eight
+SM90 GPUs. If only `RUNTIME_ENV_FILE` is supplied, its parent is accepted as
+the venv only when `bin/python` exists there; otherwise the command stops
+instead of silently selecting another environment.
+
+The updater preserves the wrapper's driver forward-compatibility setup and has
+no dependency-download path. In actual-update mode it can bootstrap a missing
+pip through offline `ensurepip`, restore executable bits stripped from a
+transferred pip CUDA compiler, and construct an unversioned overlay for a
+versioned-only `libcudart.so.<major>`. A compiler/header minor mismatch such as
+CUDA compiler 13.3 with CUDA 13.0 headers is allowed only within the same major;
+the build then records and applies `CCCL_DISABLE_CTK_COMPATIBILITY_CHECK`.
+Different CUDA majors remain a hard error. Set `REPAIR_TOOL_EXEC_BITS=0` or
+`ALLOW_CCCL_MINOR_MISMATCH=0` to disable either repair explicitly.
 
 Run its read-only preflight first. Success is
 `H20_SPLITK_PREFLIGHT_OK`; this command does not deploy, compile, or install:
@@ -175,11 +185,19 @@ Run its read-only preflight first. Success is
 R='/mnt/public03/task/236362/GQLA'
 RELAY='/root/h20test-splitk-lite-20260818'
 MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
+E="$R/envs/venv-py312"
+W="$E/h20-runtime-splitk.env"
 
-GQLA_ROOT="$R" MODEL_DIR="$MODEL" PREFLIGHT_ONLY=1 \
+GQLA_ROOT="$R" MODEL_DIR="$MODEL" VENV_DIR="$E" \
+RUNTIME_ENV_FILE="$W" PREFLIGHT_ONLY=1 \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash "$RELAY/deploy/h20-vllm/update_h20_splitk_only.sh"
 ```
+
+Preflight never changes permissions or bootstraps pip. If it reports that nvcc
+is present but non-executable, run the actual update with the default repair
+enabled after confirming the path is inside the selected venv; a `noexec`
+mount still requires infrastructure repair.
 
 Then deploy the plugin and rebuild only HPC-Ops:
 
@@ -188,8 +206,11 @@ R='/mnt/public03/task/236362/GQLA'
 RELAY='/root/h20test-splitk-lite-20260818'
 MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
 HPC_NEW="$R/code/hpc-ops-de202c9"
+E="$R/envs/venv-py312"
+W="$E/h20-runtime-splitk.env"
 
 GQLA_ROOT="$R" MODEL_DIR="$MODEL" HPC_OPS_DIR="$HPC_NEW" \
+VENV_DIR="$E" RUNTIME_ENV_FILE="$W" \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash "$RELAY/deploy/h20-vllm/update_h20_splitk_only.sh"
 ```
@@ -198,7 +219,12 @@ Success is `H20_SPLITK_HPC_ONLY_OK`. The updater writes
 `h20-splitk-runtime.env` and a build manifest inside the selected venv, keeps
 the compiled wheel under `envs/wheels/hpc-splitk`, and does not modify the
 converted checkpoint. Re-running it intentionally rebuilds the exact
-`de202c9` adaptive split-K source for the selected Torch/CUDA ABI.
+`de202c9` adaptive split-K source for the selected Torch/CUDA ABI. The manifest
+also records compiler/header versions, the selected cudart, any executable-bit
+repair, and any CCCL compatibility flag. These install markers prove the
+extension build and runtime/schema check; a real vLLM request must still emit
+the expected kernel HIT/policy trace with zero eligible fallback before the
+integration is considered complete.
 The lower-level `setup_h20_cu129_env.sh` also defaults to
 `ALLOW_CORE_DOWNLOADS=0`; a full environment installation must now opt in
 explicitly with `ALLOW_CORE_DOWNLOADS=1` and should use OSS when direct wheel
