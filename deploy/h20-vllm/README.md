@@ -160,7 +160,11 @@ pip. If the full serving environment is absent or has the wrong Torch/vLLM
 stack, transfer the environment or wheel bundle through a verified OSS prefix;
 do not put Python, uv, CUDA wheels, or a venv in this Git branch.
 
-Deploy and immediately create/check the environment in one command:
+For a split-K source refresh on a machine that already ran vLLM, use the
+HPC-only updater. It auto-selects an existing environment only when it exactly
+matches Torch 2.11/cu129, vLLM 0.22.1, and Transformers 5.12.1. It sets
+`ALLOW_CORE_DOWNLOADS=0`, uses no-index local installs, and aborts rather than
+downloading vLLM, FlashInfer, CUDA wheels, Python, or uv:
 
 ```bash
 R='/mnt/public03/task/236362/GQLA'
@@ -169,14 +173,18 @@ MODEL="$R/outputs/convert/dsv3p1_g8_sim_hess_no_mean_subtract"
 HPC_NEW="$R/code/hpc-ops-de202c9"
 
 GQLA_ROOT="$R" MODEL_DIR="$MODEL" HPC_OPS_DIR="$HPC_NEW" \
-FORCE_HPC_REBUILD=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-bash "$RELAY/deploy/h20-vllm/setup_h20_cu129_env.sh"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash "$RELAY/deploy/h20-vllm/update_h20_splitk_only.sh"
 ```
 
 The expected existing CUDA 12.9 environment is
 `/mnt/public03/task/236362/GQLA/envs/h20-cu129-py312`. Re-running the command
 reuses that environment and rebuilds HPC-Ops only when requested or when the
 source fingerprint differs. It does not modify the converted checkpoint.
+The lower-level `setup_h20_cu129_env.sh` also defaults to
+`ALLOW_CORE_DOWNLOADS=0`; a full environment installation must now opt in
+explicitly with `ALLOW_CORE_DOWNLOADS=1` and should use OSS when direct wheel
+downloads are slow.
 
 Run the three GQLA C=64 cases separately after setup:
 
