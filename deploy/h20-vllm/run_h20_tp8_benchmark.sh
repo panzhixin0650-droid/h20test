@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run exactly one H20 TP=8 benchmark case from the clean cu129 environment.
+# Run exactly one H20 TP=8 benchmark case from a verified split-K runtime.
 # Usage: bash run_h20_tp8_benchmark.sh {mla|gqla} {2k|8k|16k|16k-b20}
 
 set -Eeuo pipefail
@@ -90,8 +90,25 @@ PY
 }
 
 GQLA_ROOT=${GQLA_ROOT:-$(infer_gqla_root)}
+if [[ -z "${VENV_DIR:-}" ]]; then
+    for candidate in \
+        "$GQLA_ROOT/envs/venv-py312" \
+        "$GQLA_ROOT/envs/h20-new" \
+        "$GQLA_ROOT/envs/h20-cu129-py312"; do
+        if [[ -f "$candidate/h20-splitk-runtime.env" ]]; then
+            VENV_DIR=$candidate
+            break
+        fi
+    done
+fi
 VENV_DIR=${VENV_DIR:-$GQLA_ROOT/envs/h20-cu129-py312}
-RUNTIME_ENV_FILE=${RUNTIME_ENV_FILE:-$VENV_DIR/h20-runtime.env}
+if [[ -z "${RUNTIME_ENV_FILE:-}" ]]; then
+    if [[ -f "$VENV_DIR/h20-splitk-runtime.env" ]]; then
+        RUNTIME_ENV_FILE=$VENV_DIR/h20-splitk-runtime.env
+    else
+        RUNTIME_ENV_FILE=$VENV_DIR/h20-runtime.env
+    fi
+fi
 ROUTE=${1:-${ROUTE:-}}
 PROFILE=${2:-${PROFILE:-}}
 (( $# <= 2 )) || die "usage: $0 {mla|gqla} {2k|8k|16k|16k-b20}"
@@ -100,11 +117,11 @@ PROFILE=${2:-${PROFILE:-}}
 
 sanitize_cuda13_compat
 [[ -f "$RUNTIME_ENV_FILE" ]] \
-    || die "fresh cu129 environment is not ready; first run setup_h20_cu129_env.sh"
+    || die "verified H20 runtime is not ready; first run update_h20_splitk_only.sh"
 # shellcheck disable=SC1090
 source "$RUNTIME_ENV_FILE"
-[[ "${H20_CU129_RUNTIME:-0}" == 1 ]] \
-    || die "runtime manifest is not the clean H20 cu129 environment: $RUNTIME_ENV_FILE"
+[[ "${H20_CU129_RUNTIME:-0}" == 1 || "${H20_GQLA_EXISTING_RUNTIME:-0}" == 1 ]] \
+    || die "runtime manifest is not a verified H20 split-K environment: $RUNTIME_ENV_FILE"
 
 BASE_SCRIPT=${BASE_SCRIPT:-$GQLA_REPO/scripts/benchmark_dsv3p1_g8_h20_tp8.sh}
 [[ -f "$BASE_SCRIPT" ]] || die "benchmark backend is missing: $BASE_SCRIPT"
